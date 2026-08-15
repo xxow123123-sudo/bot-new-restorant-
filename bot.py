@@ -15,7 +15,11 @@ class RestaurantBot(commands.Bot):
 
     async def setup_hook(self):
         await init_db()
+<<<<<<< HEAD
+        for ext in ("cogs.settings", "cogs.general", "cogs.panels", "cogs.bot_profile"):
+=======
         for ext in ("cogs.settings", "cogs.general", "cogs.panels"):
+>>>>>>> 849f5d4aa636db73db2342fffa2452e76458c205
             await self.load_extension(ext)
             print(f"✅ Loaded: {ext}")
 
@@ -41,4 +45,8 @@ async def main():
         await bot.start(TOKEN)
 
 if __name__ == "__main__":
+<<<<<<< HEAD
     asyncio.run(main())
+=======
+    asyncio.run(main())
+>>>>>>> 849f5d4aa636db73db2342fffa2452e76458c205
