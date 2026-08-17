@@ -54,24 +54,21 @@ class ChannelPicker(discord.ui.ChannelSelect):
         self.setting_key = key
         self.setting_label = label
 
-        # الكاتقوري يختار Category فقط، وباقي الإعدادات تعرض رومات السيرفر المتاحة.
+        # كاتقوري تذاكر المقبولين لازم يكون Category فقط.
         if key == "application_ticket_category":
-            channel_types = [discord.ChannelType.category]
+            super().__init__(
+                placeholder=f"اختر {label}",
+                channel_types=[discord.ChannelType.category],
+                min_values=1,
+                max_values=1,
+            )
         else:
-            channel_types = [
-                discord.ChannelType.text,
-                discord.ChannelType.news,
-                discord.ChannelType.voice,
-                discord.ChannelType.stage_voice,
-                discord.ChannelType.forum,
-            ]
-
-        super().__init__(
-            placeholder=f"اختر {label}",
-            channel_types=channel_types,
-            min_values=1,
-            max_values=1,
-        )
+            # بدون channel_types عشان Discord يعرض كل الرومات المتاحة.
+            super().__init__(
+                placeholder=f"اختر {label}",
+                min_values=1,
+                max_values=1,
+            )
 
     async def callback(self, interaction: discord.Interaction):
         if interaction.guild is None:
