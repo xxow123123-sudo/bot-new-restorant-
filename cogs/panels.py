@@ -84,7 +84,12 @@ async def send_image_to_log(log_channel, attachment, embed):
     file = discord.File(BytesIO(image_bytes), filename=filename)
     embed.set_image(url=f"attachment://{filename}")
     msg = await log_channel.send(embed=embed, file=file)
-    return msg.attachments[0].url if msg.attachments else None
+
+    # بعض رسائل Discord تعرض الصورة داخل الـ embed بدون أن ترجعها في
+    # msg.attachments. لا نوقف العملية بسبب ذلك؛ نستخدم رابط الرسالة كمرجع.
+    if msg.attachments:
+        return msg.attachments[0].url
+    return msg.jump_url
 
 async def send_admin_log(interaction, title, description):
     channel = await get_log_channel(interaction, "admin_log")
@@ -113,7 +118,8 @@ class CheckInButton(discord.ui.Button):
             log_url = await send_image_to_log(log_channel, attachment, embed)
         except discord.HTTPException:
             return await interaction.followup.send("تعذر رفع الصورة إلى اللوق.", ephemeral=True)
-        if not log_url: return await interaction.followup.send("تعذر حفظ الصورة.", ephemeral=True)
+        # إذا وصل اللوق بنجاح نسجل الدوام حتى لو Discord لم يرجع رابط attachment.
+        log_url = log_url or source_message.attachments[0].url
         try:
             await start_attendance(interaction.guild.id, interaction.user.id, now.isoformat(), log_url)
         except Exception as exc:
@@ -150,6 +156,7 @@ class CheckOutButton(discord.ui.Button):
         embed.add_field(name="وقت الخروج", value=f"<t:{int(now.timestamp())}:F>", inline=False)
         try: log_url = await send_image_to_log(log_channel, attachment, embed)
         except discord.HTTPException: return await interaction.followup.send("تعذر رفع الصورة إلى اللوق.", ephemeral=True)
+        log_url = log_url or source_message.attachments[0].url
         try:
             await finish_attendance(session_id, interaction.guild.id, interaction.user.id, now.isoformat(), log_url, worked, earned)
         except Exception as exc:
@@ -180,6 +187,7 @@ class InvoiceButton(discord.ui.Button):
         embed.add_field(name="النقاط", value="+1 نقطة", inline=False)
         try: log_url = await send_image_to_log(log_channel, attachment, embed)
         except discord.HTTPException: return await interaction.followup.send("تعذر رفع صورة الفاتورة إلى اللوق.", ephemeral=True)
+        log_url = log_url or source_message.attachments[0].url
         await add_invoice(interaction.guild.id, interaction.user.id, now.isoformat(), log_url)
         try: await source_message.delete()
         except (discord.Forbidden, discord.NotFound, discord.HTTPException): pass
