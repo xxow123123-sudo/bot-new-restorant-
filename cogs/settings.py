@@ -42,7 +42,6 @@ ROLE_KEYS = {
     "employee_role": "رتبة الموظف",
     "vacation_role": "رتبة الإجازة",
     "admin_role": "رتبة الإدارة",
-    "hr_role": "رتبة الموارد البشرية",
 }
 
 
@@ -55,11 +54,17 @@ class ChannelPicker(discord.ui.ChannelSelect):
         self.setting_key = key
         self.setting_label = label
 
-        # الكاتقوري يسمح باختيار Category
+        # الكاتقوري يختار Category فقط، وباقي الإعدادات تعرض رومات السيرفر المتاحة.
         if key == "application_ticket_category":
             channel_types = [discord.ChannelType.category]
         else:
-            channel_types = [discord.ChannelType.text]
+            channel_types = [
+                discord.ChannelType.text,
+                discord.ChannelType.news,
+                discord.ChannelType.voice,
+                discord.ChannelType.stage_voice,
+                discord.ChannelType.forum,
+            ]
 
         super().__init__(
             placeholder=f"اختر {label}",
@@ -84,8 +89,9 @@ class ChannelPicker(discord.ui.ChannelSelect):
             str(channel.id)
         )
 
+        mention = getattr(channel, "mention", f"#{channel.name}")
         await interaction.response.send_message(
-            f"✅ تم تعيين **{self.setting_label}** إلى {channel.mention}",
+            f"✅ تم تعيين **{self.setting_label}** إلى {mention}",
             ephemeral=True
         )
 
