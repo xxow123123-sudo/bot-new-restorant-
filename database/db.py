@@ -73,7 +73,72 @@ CREATE TABLE IF NOT EXISTS employee_departures (
 """
 
 async def init_db():
+    """Initialize the database and safely repair legacy table schemas.
+
+    Older RestaurantBot versions used different attendance/invoice schemas.
+    CREATE TABLE IF NOT EXISTS does not upgrade an existing SQLite table, so
+    those old tables can make a new check-in fail *after* its image is posted.
+    Incompatible legacy tables are preserved under a legacy_* name.
+    """
     async with aiosqlite.connect(DB_PATH) as db:
+        async def table_info(table_name: str):
+            cur = await db.execute(f'PRAGMA table_info("{table_name}")')
+            return await cur.fetchall()
+
+        async def table_exists(table_name: str):
+            cur = await db.execute(
+                "SELECT 1 FROM sqlite_master WHERE type='table' AND name=?",
+                (table_name,)
+            )
+            return await cur.fetchone() is not None
+
+        async def backup_if_incompatible(table_name: str, required_columns: set[str], insert_columns: set[str]):
+            if not await table_exists(table_name):
+                return
+
+            info = await table_info(table_name)
+            columns = {row[1] for row in info}
+
+            # Missing columns required by the current code => legacy schema.
+            incompatible = not required_columns.issubset(columns)
+
+            # A legacy NOT NULL column with no default that current INSERTs do
+            # not provide would also make inserts fail.
+            for row in info:
+                _, name, _, notnull, default_value, pk = row
+                if name not in insert_columns and notnull and default_value is None and not pk:
+                    incompatible = True
+                    break
+
+            if incompatible:
+                suffix = 1
+                backup_name = f"legacy_{table_name}"
+                while await table_exists(backup_name):
+                    suffix += 1
+                    backup_name = f"legacy_{table_name}_{suffix}"
+                await db.execute(
+                    f'ALTER TABLE "{table_name}" RENAME TO "{backup_name}"'
+                )
+                print(f"⚠️ Migrated old table {table_name} -> {backup_name}")
+
+        await backup_if_incompatible(
+            "employees",
+            {"guild_id", "user_id", "points", "total_work_seconds", "total_invoices", "total_tasks"},
+            {"guild_id", "user_id", "points", "total_work_seconds", "total_invoices", "total_tasks"},
+        )
+        await backup_if_incompatible(
+            "attendance",
+            {"id", "guild_id", "user_id", "check_in_at", "check_in_image", "check_out_at",
+             "check_out_image", "worked_seconds", "points_earned", "forced_by"},
+            {"guild_id", "user_id", "check_in_at", "check_in_image", "check_out_at",
+             "check_out_image", "worked_seconds", "points_earned", "forced_by"},
+        )
+        await backup_if_incompatible(
+            "invoices",
+            {"id", "guild_id", "user_id", "created_at", "image_url", "points_earned"},
+            {"guild_id", "user_id", "created_at", "image_url", "points_earned"},
+        )
+
         await db.executescript(CREATE_TABLES)
         await db.commit()
 

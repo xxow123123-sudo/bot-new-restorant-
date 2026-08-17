@@ -114,7 +114,14 @@ class CheckInButton(discord.ui.Button):
         except discord.HTTPException:
             return await interaction.followup.send("تعذر رفع الصورة إلى اللوق.", ephemeral=True)
         if not log_url: return await interaction.followup.send("تعذر حفظ الصورة.", ephemeral=True)
-        await start_attendance(interaction.guild.id, interaction.user.id, now.isoformat(), log_url)
+        try:
+            await start_attendance(interaction.guild.id, interaction.user.id, now.isoformat(), log_url)
+        except Exception as exc:
+            print(f"❌ Check-in database error: {type(exc).__name__}: {exc}")
+            return await interaction.followup.send(
+                "تم رفع الصورة للوق لكن تعذر تسجيل الدخول في قاعدة البيانات. راجع Console البوت.",
+                ephemeral=True
+            )
         try: await source_message.delete()
         except (discord.Forbidden, discord.NotFound, discord.HTTPException): pass
         await interaction.followup.send("تم تسجيل دخولك بنجاح.", ephemeral=True)
@@ -143,7 +150,14 @@ class CheckOutButton(discord.ui.Button):
         embed.add_field(name="وقت الخروج", value=f"<t:{int(now.timestamp())}:F>", inline=False)
         try: log_url = await send_image_to_log(log_channel, attachment, embed)
         except discord.HTTPException: return await interaction.followup.send("تعذر رفع الصورة إلى اللوق.", ephemeral=True)
-        await finish_attendance(session_id, interaction.guild.id, interaction.user.id, now.isoformat(), log_url, worked, earned)
+        try:
+            await finish_attendance(session_id, interaction.guild.id, interaction.user.id, now.isoformat(), log_url, worked, earned)
+        except Exception as exc:
+            print(f"❌ Check-out database error: {type(exc).__name__}: {exc}")
+            return await interaction.followup.send(
+                "تم رفع الصورة للوق لكن تعذر تسجيل الخروج في قاعدة البيانات. راجع Console البوت.",
+                ephemeral=True
+            )
         try: await source_message.delete()
         except (discord.Forbidden, discord.NotFound, discord.HTTPException): pass
         await interaction.followup.send(f"تم تسجيل خروجك. حصلت على **{format_points(earned)} نقطة**.", ephemeral=True)
