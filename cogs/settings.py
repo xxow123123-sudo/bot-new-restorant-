@@ -46,39 +46,64 @@ ROLE_KEYS = {
 
 
 # =========================
-# اختيار الروم نفسه
+# اختيار الرومات - قائمة من البوت نفسه
 # =========================
 
-class ChannelPicker(discord.ui.ChannelSelect):
+def channel_label(channel):
+    category = getattr(channel, "category", None)
+    if category:
+        return f"{category.name} / {channel.name}"
+    return channel.name
+
+
+class ManualChannelIdModal(discord.ui.Modal):
     def __init__(self, key: str, label: str):
+        super().__init__(title=f"تعيين {label}")
         self.setting_key = key
         self.setting_label = label
 
-        # كاتقوري تذاكر المقبولين لازم يكون Category فقط.
-        if key == "application_ticket_category":
-            super().__init__(
-                placeholder=f"اختر {label}",
-                channel_types=[discord.ChannelType.category],
-                min_values=1,
-                max_values=1,
-            )
-        else:
-            # بدون channel_types عشان Discord يعرض كل الرومات المتاحة.
-            super().__init__(
-                placeholder=f"اختر {label}",
-                min_values=1,
-                max_values=1,
-            )
+        self.channel_id = discord.ui.TextInput(
+            label="Channel ID",
+            placeholder="الصق آيدي الروم هنا",
+            required=True,
+            max_length=25
+        )
+        self.add_item(self.channel_id)
 
-    async def callback(self, interaction: discord.Interaction):
+    async def on_submit(self, interaction: discord.Interaction):
         if interaction.guild is None:
-            await interaction.response.send_message(
+            return await interaction.response.send_message(
                 "هذا الخيار يعمل داخل السيرفر فقط.",
                 ephemeral=True
             )
-            return
 
-        channel = self.values[0]
+        try:
+            channel_id = int(str(self.channel_id.value).strip())
+        except ValueError:
+            return await interaction.response.send_message(
+                "آيدي الروم غير صحيح.",
+                ephemeral=True
+            )
+
+        channel = interaction.guild.get_channel(channel_id)
+        if channel is None:
+            return await interaction.response.send_message(
+                "ما لقيت روم بهذا الآيدي داخل السيرفر.",
+                ephemeral=True
+            )
+
+        if self.setting_key == "application_ticket_category":
+            if not isinstance(channel, discord.CategoryChannel):
+                return await interaction.response.send_message(
+                    "هذا الإعداد يحتاج **كاتقوري** وليس روم عادي.",
+                    ephemeral=True
+                )
+        else:
+            if not isinstance(channel, (discord.TextChannel, discord.VoiceChannel, discord.StageChannel, discord.ForumChannel)):
+                return await interaction.response.send_message(
+                    "نوع هذا الروم غير مدعوم لهذا الإعداد.",
+                    ephemeral=True
+                )
 
         await set_setting(
             interaction.guild.id,
@@ -86,34 +111,120 @@ class ChannelPicker(discord.ui.ChannelSelect):
             str(channel.id)
         )
 
-        mention = getattr(channel, "mention", f"#{channel.name}")
+        mention = getattr(channel, "mention", channel.name)
         await interaction.response.send_message(
             f"✅ تم تعيين **{self.setting_label}** إلى {mention}",
             ephemeral=True
         )
 
 
-class ChannelPickerView(discord.ui.View):
+class ChannelListSelect(discord.ui.Select):
+    def __init__(self, key: str, label: str, channels, page: int = 0):
+        self.setting_key = key
+        self.setting_label = label
+        self.all_channels = channels
+        self.page = page
+
+        start = page * 25
+        chunk = channels[start:start + 25]
+
+        options = []
+        for channel in chunk:
+            name = channel_label(channel)
+            options.append(
+                discord.SelectOption(
+                    label=name[:100],
+                    value=str(channel.id),
+                    description=f"ID: {channel.id}"[:100]
+                )
+            )
+
+        super().__init__(
+            placeholder=f"اختر {label} - صفحة {page + 1}",
+            options=options,
+            min_values=1,
+            max_values=1
+        )
+
+    async def callback(self, interaction: discord.Interaction):
+        channel_id = int(self.values[0])
+        channel = interaction.guild.get_channel(channel_id)
+
+        if channel is None:
+            return await interaction.response.send_message(
+                "الروم لم يعد موجودًا.",
+                ephemeral=True
+            )
+
+        await set_setting(
+            interaction.guild.id,
+            self.setting_key,
+            str(channel.id)
+        )
+
+        mention = getattr(channel, "mention", channel.name)
+        await interaction.response.send_message(
+            f"✅ تم تعيين **{self.setting_label}** إلى {mention}",
+            ephemeral=True
+        )
+
+
+class ChannelListView(discord.ui.View):
+    def __init__(self, key: str, label: str, channels, page: int = 0):
+        super().__init__(timeout=180)
+        self.key = key
+        self.label = label
+        self.channels = channels
+        self.page = page
+        self.max_page = max(0, (len(channels) - 1) // 25)
+
+        self.add_item(ChannelListSelect(key, label, channels, page))
+
+        self.previous.disabled = page <= 0
+        self.next.disabled = page >= self.max_page
+
+    @discord.ui.button(label="السابق", style=discord.ButtonStyle.secondary)
+    async def previous(self, interaction: discord.Interaction, button: discord.ui.Button):
+        new_page = max(0, self.page - 1)
+        await interaction.response.edit_message(
+            content=f"اختر **{self.label}**:",
+            view=ChannelListView(self.key, self.label, self.channels, new_page)
+        )
+
+    @discord.ui.button(label="التالي", style=discord.ButtonStyle.secondary)
+    async def next(self, interaction: discord.Interaction, button: discord.ui.Button):
+        new_page = min(self.max_page, self.page + 1)
+        await interaction.response.edit_message(
+            content=f"اختر **{self.label}**:",
+            view=ChannelListView(self.key, self.label, self.channels, new_page)
+        )
+
+    @discord.ui.button(label="إدخال ID", style=discord.ButtonStyle.primary)
+    async def manual_id(self, interaction: discord.Interaction, button: discord.ui.Button):
+        await interaction.response.send_modal(
+            ManualChannelIdModal(self.key, self.label)
+        )
+
+
+class EmptyChannelListView(discord.ui.View):
     def __init__(self, key: str, label: str):
         super().__init__(timeout=180)
-        self.add_item(ChannelPicker(key, label))
+        self.key = key
+        self.label = label
 
+    @discord.ui.button(label="إدخال ID", style=discord.ButtonStyle.primary)
+    async def manual_id(self, interaction: discord.Interaction, button: discord.ui.Button):
+        await interaction.response.send_modal(
+            ManualChannelIdModal(self.key, self.label)
+        )
 
-# =========================
-# اختيار نوع الروم
-# =========================
 
 class ChannelSettingSelect(discord.ui.Select):
     def __init__(self):
-        options = []
-
-        for key, label in CHANNEL_KEYS.items():
-            options.append(
-                discord.SelectOption(
-                    label=label,
-                    value=key
-                )
-            )
+        options = [
+            discord.SelectOption(label=label, value=key)
+            for key, label in CHANNEL_KEYS.items()
+        ]
 
         super().__init__(
             placeholder="اختر إعداد الروم الذي تريد تغييره",
@@ -123,12 +234,41 @@ class ChannelSettingSelect(discord.ui.Select):
         )
 
     async def callback(self, interaction: discord.Interaction):
+        if interaction.guild is None:
+            return await interaction.response.send_message(
+                "هذا الخيار يعمل داخل السيرفر فقط.",
+                ephemeral=True
+            )
+
         key = self.values[0]
         label = CHANNEL_KEYS[key]
 
+        if key == "application_ticket_category":
+            channels = list(interaction.guild.categories)
+        else:
+            # نبني القائمة من قنوات السيرفر بدل ChannelSelect التلقائي.
+            # القنوات النصية أولاً، ثم باقي الأنواع التي قد تستخدمها الإدارة.
+            channels = list(interaction.guild.text_channels)
+
+            extra = [
+                c for c in interaction.guild.channels
+                if isinstance(c, (discord.VoiceChannel, discord.StageChannel, discord.ForumChannel))
+                and c not in channels
+            ]
+            channels.extend(extra)
+
+        channels.sort(key=lambda c: (getattr(c, "position", 0), c.name.lower()))
+
+        if not channels:
+            return await interaction.response.send_message(
+                f"ما لقيت رومات متاحة لـ **{label}**.\nتقدر تدخل الآيدي يدويًا:",
+                view=EmptyChannelListView(key, label),
+                ephemeral=True
+            )
+
         await interaction.response.send_message(
-            f"اختر الروم الخاص بـ **{label}**:",
-            view=ChannelPickerView(key, label),
+            f"اختر **{label}** من القائمة، وإذا ما لقيته استخدم **إدخال ID**:",
+            view=ChannelListView(key, label, channels, 0),
             ephemeral=True
         )
 
