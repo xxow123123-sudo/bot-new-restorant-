@@ -50,6 +50,26 @@ CREATE TABLE IF NOT EXISTS point_transactions (
     created_at TEXT NOT NULL,
     admin_id INTEGER
 );
+
+CREATE TABLE IF NOT EXISTS employee_profiles (
+    guild_id INTEGER NOT NULL,
+    user_id INTEGER NOT NULL,
+    game_name TEXT NOT NULL,
+    phone_number TEXT NOT NULL,
+    citizen_id TEXT NOT NULL,
+    hired_at TEXT NOT NULL,
+    status TEXT NOT NULL DEFAULT 'active',
+    PRIMARY KEY (guild_id, user_id)
+);
+
+CREATE TABLE IF NOT EXISTS employee_departures (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    guild_id INTEGER NOT NULL,
+    user_id INTEGER NOT NULL,
+    departure_type TEXT NOT NULL,
+    departed_at TEXT NOT NULL,
+    admin_id INTEGER
+);
 """
 
 async def init_db():
@@ -262,3 +282,37 @@ async def get_employee_stats(guild_id: int, user_id: int):
             (guild_id, user_id),
         )
         return await cur.fetchone()
+
+async def save_employee_profile(guild_id: int, user_id: int, game_name: str, phone_number: str, citizen_id: str, hired_at: str):
+    async with aiosqlite.connect(DB_PATH) as db:
+        await db.execute(
+            "INSERT INTO employee_profiles (guild_id,user_id,game_name,phone_number,citizen_id,hired_at,status) VALUES (?,?,?,?,?,?,'active') "
+            "ON CONFLICT(guild_id,user_id) DO UPDATE SET game_name=excluded.game_name, phone_number=excluded.phone_number, citizen_id=excluded.citizen_id, hired_at=excluded.hired_at, status='active'",
+            (guild_id,user_id,game_name,phone_number,citizen_id,hired_at),
+        )
+        await db.commit()
+
+async def get_employee_profile(guild_id: int, user_id: int):
+    async with aiosqlite.connect(DB_PATH) as db:
+        cur = await db.execute("SELECT user_id,game_name,phone_number,citizen_id,hired_at,status FROM employee_profiles WHERE guild_id=? AND user_id=?", (guild_id,user_id))
+        return await cur.fetchone()
+
+async def search_employee_profiles(guild_id: int, query: str):
+    q = f"%{query.strip()}%"
+    async with aiosqlite.connect(DB_PATH) as db:
+        cur = await db.execute(
+            "SELECT user_id,game_name,phone_number,citizen_id,hired_at,status FROM employee_profiles WHERE guild_id=? AND status='active' AND (game_name LIKE ? OR phone_number LIKE ? OR citizen_id LIKE ? OR CAST(user_id AS TEXT) LIKE ?) ORDER BY game_name LIMIT 25",
+            (guild_id,q,q,q,q),
+        )
+        return await cur.fetchall()
+
+async def list_employee_profiles(guild_id: int):
+    async with aiosqlite.connect(DB_PATH) as db:
+        cur = await db.execute("SELECT user_id,game_name,phone_number,citizen_id,hired_at,status FROM employee_profiles WHERE guild_id=? AND status='active' ORDER BY game_name", (guild_id,))
+        return await cur.fetchall()
+
+async def remove_employee_profile(guild_id: int, user_id: int, departure_type: str, departed_at: str, admin_id=None):
+    async with aiosqlite.connect(DB_PATH) as db:
+        await db.execute("DELETE FROM employee_profiles WHERE guild_id=? AND user_id=?", (guild_id,user_id))
+        await db.execute("INSERT INTO employee_departures (guild_id,user_id,departure_type,departed_at,admin_id) VALUES (?,?,?,?,?)", (guild_id,user_id,departure_type,departed_at,admin_id))
+        await db.commit()

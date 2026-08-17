@@ -2,6 +2,16 @@ import asyncio
 import discord
 from discord import app_commands
 from discord.ext import commands
+from database.db import get_setting
+
+ADMIN_ROLE_ID = 1538165468228223077
+
+async def profile_admin_allowed(interaction):
+    if not interaction.guild or not isinstance(interaction.user, discord.Member): return False
+    if interaction.user.guild_permissions.administrator: return True
+    rid = await get_setting(interaction.guild.id, "admin_role")
+    rid = int(rid) if rid else ADMIN_ROLE_ID
+    return any(r.id == rid for r in interaction.user.roles)
 
 
 def is_image(attachment: discord.Attachment) -> bool:
@@ -43,10 +53,12 @@ class BotSettingsView(discord.ui.View):
 
     @discord.ui.button(label="تغيير الاسم", style=discord.ButtonStyle.primary)
     async def change_name(self, interaction: discord.Interaction, button: discord.ui.Button):
+        if not await profile_admin_allowed(interaction): return await interaction.response.send_message("هذا الزر مخصص للإدارة فقط.", ephemeral=True)
         await interaction.response.send_modal(ChangeNameModal())
 
     @discord.ui.button(label="تغيير الصورة", style=discord.ButtonStyle.primary)
     async def change_avatar(self, interaction: discord.Interaction, button: discord.ui.Button):
+        if not await profile_admin_allowed(interaction): return await interaction.response.send_message("هذا الزر مخصص للإدارة فقط.", ephemeral=True)
         await interaction.response.send_message(
             "أرسل **الصورة الجديدة للبوت** في نفس الشات خلال دقيقتين.",
             ephemeral=True,
@@ -91,6 +103,7 @@ class BotSettingsView(discord.ui.View):
 
     @discord.ui.button(label="عرض الحالي", style=discord.ButtonStyle.secondary)
     async def show_current(self, interaction: discord.Interaction, button: discord.ui.Button):
+        if not await profile_admin_allowed(interaction): return await interaction.response.send_message("هذا الزر مخصص للإدارة فقط.", ephemeral=True)
         user = self.bot.user
         embed = discord.Embed(title="إعدادات البوت الحالية")
         embed.add_field(name="الاسم", value=user.name, inline=False)
@@ -109,8 +122,8 @@ class BotProfileCog(commands.Cog):
         name="تعديل-البوت",
         description="تغيير اسم وصورة البوت"
     )
-    @app_commands.default_permissions(administrator=True)
     async def edit_bot(self, interaction: discord.Interaction):
+        if not await profile_admin_allowed(interaction): return await interaction.response.send_message("هذا الأمر مخصص للإدارة فقط.", ephemeral=True)
         embed = discord.Embed(
             title="إعدادات البوت",
             description="اختر ما تريد تعديله من الأزرار بالأسفل."

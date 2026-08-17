@@ -19,10 +19,8 @@ class RestaurantBot(commands.Bot):
 
         for ext in (
             "cogs.settings",
-            "cogs.general",
             "cogs.panels",
             "cogs.bot_profile",
-            "cogs.welcome",
         ):
             await self.load_extension(ext)
             print(f"✅ Loaded: {ext}")

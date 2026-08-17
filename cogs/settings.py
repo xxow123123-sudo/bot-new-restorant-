@@ -4,6 +4,18 @@ from discord.ext import commands
 
 from database.db import set_setting, get_all_settings
 
+ADMIN_ROLE_ID = 1538165468228223077
+
+async def settings_admin_allowed(interaction: discord.Interaction) -> bool:
+    if not interaction.guild or not isinstance(interaction.user, discord.Member):
+        return False
+    if interaction.user.guild_permissions.administrator:
+        return True
+    configured = await __import__("database.db", fromlist=["get_setting"]).get_setting(interaction.guild.id, "admin_role")
+    role_id = int(configured) if configured else ADMIN_ROLE_ID
+    return any(r.id == role_id for r in interaction.user.roles)
+
+
 
 # =========================
 # إعدادات الرومات
@@ -17,6 +29,8 @@ CHANNEL_KEYS = {
     "vacation_review": "طلبات الإجازات",
     "hr_review": "طلبات الموارد البشرية",
     "admin_log": "اللوق الإداري",
+    "resignation_review": "طلبات الاستقالات",
+    "employee_database_channel": "قاعدة بيانات الموظفين",
 }
 
 
@@ -344,11 +358,12 @@ class SettingsCog(commands.Cog):
         name="settings",
         description="تعديل رومات ورتب البوت"
     )
-    @app_commands.default_permissions(administrator=True)
     async def settings(
         self,
         interaction: discord.Interaction
     ):
+        if not await settings_admin_allowed(interaction):
+            return await interaction.response.send_message("هذا الأمر مخصص للإدارة فقط.", ephemeral=True)
         await interaction.response.send_message(
             "⚙️ **لوحة إعدادات البوت**\nاختر الشيء الذي تريد تعديله:",
             view=SettingsView(),

@@ -9,6 +9,7 @@ from database.db import (
     get_setting, get_points, get_active_attendance, get_all_active_attendance,
     start_attendance, finish_attendance, force_finish_attendance, add_invoice,
     add_points, set_points, reset_all_points, add_task, get_all_employee_stats, get_employee_stats,
+    save_employee_profile, get_employee_profile, search_employee_profiles, list_employee_profiles, remove_employee_profile,
 )
 
 def format_points(value: float) -> str:
@@ -38,6 +39,8 @@ async def employee_allowed(interaction: discord.Interaction) -> bool:
     await interaction.response.send_message("هذا الزر مخصص للموظفين فقط.", ephemeral=True)
     return False
 
+ADMIN_ROLE_ID = 1538165468228223077
+
 async def admin_allowed(interaction: discord.Interaction) -> bool:
     if not interaction.guild or not isinstance(interaction.user, discord.Member):
         await interaction.response.send_message("هذا الزر يعمل داخل السيرفر فقط.", ephemeral=True)
@@ -45,7 +48,8 @@ async def admin_allowed(interaction: discord.Interaction) -> bool:
     if interaction.user.guild_permissions.administrator:
         return True
     role_id = await get_setting(interaction.guild.id, "admin_role")
-    if role_id and any(role.id == int(role_id) for role in interaction.user.roles):
+    role_id = int(role_id) if role_id else ADMIN_ROLE_ID
+    if any(role.id == role_id for role in interaction.user.roles):
         return True
     await interaction.response.send_message("هذا الزر مخصص للإدارة فقط.", ephemeral=True)
     return False
@@ -201,6 +205,8 @@ class MemberPicker(discord.ui.UserSelect):
             await interaction.response.send_modal(PointsModal(member.id, member.mention, self.action))
         elif self.action == "task":
             await interaction.response.send_modal(TaskModal(member.id, member.mention))
+        elif self.action == "fire":
+            await interaction.response.send_modal(FireEmployeeModal(member.id, member.mention))
         elif self.action == "stats":
             stats = await get_employee_stats(interaction.guild.id, member.id)
             points, seconds, invoices, tasks = stats
@@ -283,8 +289,8 @@ class AdminButton(discord.ui.Button):
         super().__init__(label=label, custom_id=custom_id, style=style)
     async def callback(self, interaction):
         if not await admin_allowed(interaction): return
-        if self.action in ("force","add","remove","task","stats","reset"):
-            labels = {"force":"اختر الموظف لتسجيل خروجه إجباريًا:", "add":"اختر الموظف لزيادة نقاطه:", "remove":"اختر الموظف لخصم نقاطه:", "task":"اختر الموظف لاحتساب مهمة له:", "stats":"اختر الموظف لعرض إحصائياته:", "reset":"اختر الموظف لتصفير نقاطه:"}
+        if self.action in ("force","add","remove","task","stats","reset","fire"):
+            labels = {"force":"اختر الموظف لتسجيل خروجه إجباريًا:", "add":"اختر الموظف لزيادة نقاطه:", "remove":"اختر الموظف لخصم نقاطه:", "task":"اختر الموظف لاحتساب مهمة له:", "stats":"اختر الموظف لعرض إحصائياته:", "reset":"اختر الموظف لتصفير نقاطه:", "fire":"اختر الموظف الذي تريد فصله:"}
             return await interaction.response.send_message(labels[self.action], view=MemberPickerView(self.action), ephemeral=True)
         if self.action == "active":
             rows = await get_all_active_attendance(interaction.guild.id)
@@ -334,6 +340,7 @@ class AdminPanel(discord.ui.View):
         self.add_item(AdminButton("إحصائيات موظف","admin:stats_one","stats"))
         self.add_item(AdminButton("تصفير الجميع","admin:reset_all","reset_all",discord.ButtonStyle.danger))
         self.add_item(AdminButton("تصفير موظف","admin:reset_one","reset",discord.ButtonStyle.danger))
+        self.add_item(AdminButton("فصل موظف","admin:fire_employee","fire",discord.ButtonStyle.danger))
 
 class ApplicationModal(discord.ui.Modal):
     def __init__(self):
@@ -951,7 +958,7 @@ class HRModal(discord.ui.Modal):
 
         await review_channel.send(
             embed=embed,
-            view=HRReviewView(interaction.user.id)
+            view=HRReviewView(interaction.user.id, self.game_name.value, self.phone_number.value, self.citizen_id.value)
         )
 
         await interaction.response.send_message(
@@ -980,9 +987,12 @@ class HRPanelView(discord.ui.View):
 
 
 class HRReviewView(discord.ui.View):
-    def __init__(self, member_id: int):
+    def __init__(self, member_id: int, game_name: str, phone_number: str, citizen_id: str):
         super().__init__(timeout=None)
         self.member_id = member_id
+        self.game_name = game_name
+        self.phone_number = phone_number
+        self.citizen_id = citizen_id
 
         accept = discord.ui.Button(
             label="قبول",
@@ -1048,6 +1058,10 @@ class HRReviewView(discord.ui.View):
                 ephemeral=True
             )
 
+        await save_employee_profile(
+            guild.id, member.id, self.game_name, self.phone_number, self.citizen_id, datetime.now(timezone.utc).isoformat()
+        )
+
         if interaction.message:
             embed = interaction.message.embeds[0] if interaction.message.embeds else discord.Embed(title="استبيان موارد بشرية")
             embed.add_field(
@@ -1096,6 +1110,175 @@ class HRReviewView(discord.ui.View):
         )
 
 
+
+async def end_employee_membership(interaction, member: discord.Member, departure_type: str):
+    guild = interaction.guild
+    active = await get_active_attendance(guild.id, member.id)
+    worked_text = None
+    if active:
+        session_id, check_in_at, _ = active
+        now = datetime.now(timezone.utc)
+        worked = max(0, int((now - datetime.fromisoformat(check_in_at)).total_seconds()))
+        earned = round((worked / 3600) * 5, 2)
+        await force_finish_attendance(session_id, guild.id, member.id, now.isoformat(), worked, earned, interaction.user.id)
+        worked_text = f"{format_duration(worked)} / {format_points(earned)} نقطة"
+
+    roles_to_remove = []
+    for key in ("employee_role", "vacation_role"):
+        rid = await get_setting(guild.id, key)
+        if rid:
+            role = guild.get_role(int(rid))
+            if role and role in member.roles:
+                roles_to_remove.append(role)
+    if roles_to_remove:
+        try:
+            await member.remove_roles(*roles_to_remove, reason=departure_type)
+        except discord.Forbidden:
+            pass
+
+    await remove_employee_profile(guild.id, member.id, departure_type, datetime.now(timezone.utc).isoformat(), interaction.user.id)
+    return worked_text
+
+
+class FireEmployeeModal(discord.ui.Modal):
+    def __init__(self, member_id: int, mention: str):
+        super().__init__(title="فصل موظف")
+        self.member_id = member_id
+        self.mention = mention
+        self.message_text = discord.ui.TextInput(label="رسالة الإدارة", placeholder="اكتب رسالة الفصل", style=discord.TextStyle.paragraph, required=True, max_length=1000)
+        self.add_item(self.message_text)
+
+    async def on_submit(self, interaction: discord.Interaction):
+        if not await admin_allowed(interaction): return
+        member = interaction.guild.get_member(self.member_id)
+        if not member:
+            try: member = await interaction.guild.fetch_member(self.member_id)
+            except discord.HTTPException: member = None
+        if not member:
+            return await interaction.response.send_message("ما قدرت ألقى الموظف داخل السيرفر.", ephemeral=True)
+        await interaction.response.defer(ephemeral=True)
+        dm_ok = True
+        try:
+            await member.send(f"تم إنهاء عملك في **Bean Machine**.\n\n**رسالة الإدارة:**\n{self.message_text.value}")
+        except discord.HTTPException:
+            dm_ok = False
+        worked = await end_employee_membership(interaction, member, "فصل")
+        desc = f"الموظف: {member.mention}\nرسالة الإدارة: {self.message_text.value}"
+        if worked: desc += f"\nتم إنهاء الدوام: {worked}"
+        await send_admin_log(interaction, "فصل موظف", desc)
+        await interaction.followup.send(f"تم فصل {member.mention} وحذف بياناته الوظيفية." + ("" if dm_ok else "\nتعذر إرسال الخاص للعضو."), ephemeral=True)
+
+
+class ResignationModal(discord.ui.Modal):
+    def __init__(self):
+        super().__init__(title="طلب استقالة")
+        self.reason = discord.ui.TextInput(label="سبب الاستقالة", style=discord.TextStyle.paragraph, required=True, max_length=700)
+        self.final = discord.ui.TextInput(label="هل الاستقالة نهائية؟", placeholder="نعم / لا", required=True, max_length=20)
+        self.notes = discord.ui.TextInput(label="ملاحظات إضافية", required=False, style=discord.TextStyle.paragraph, max_length=500)
+        self.add_item(self.reason); self.add_item(self.final); self.add_item(self.notes)
+
+    async def on_submit(self, interaction: discord.Interaction):
+        if not await employee_allowed(interaction): return
+        cid = await get_setting(interaction.guild.id, "resignation_review")
+        channel = interaction.guild.get_channel(int(cid)) if cid else None
+        if not isinstance(channel, discord.TextChannel):
+            return await interaction.response.send_message("روم مراجعة الاستقالات غير محدد. اضبطه من `/settings`.", ephemeral=True)
+        embed = discord.Embed(title="طلب استقالة جديد", timestamp=datetime.now(timezone.utc))
+        embed.add_field(name="الموظف", value=interaction.user.mention, inline=False)
+        embed.add_field(name="سبب الاستقالة", value=self.reason.value, inline=False)
+        embed.add_field(name="هل الاستقالة نهائية؟", value=self.final.value, inline=False)
+        embed.add_field(name="ملاحظات إضافية", value=self.notes.value or "لا يوجد", inline=False)
+        await channel.send(embed=embed, view=ResignationReviewView(interaction.user.id))
+        await interaction.response.send_message("تم إرسال طلب استقالتك للإدارة.", ephemeral=True)
+
+
+class ResignationButton(discord.ui.Button):
+    def __init__(self):
+        super().__init__(label="تقديم استقالة", style=discord.ButtonStyle.danger, custom_id="panel:resignation")
+    async def callback(self, interaction):
+        if not await employee_allowed(interaction): return
+        await interaction.response.send_modal(ResignationModal())
+
+class ResignationPanelView(discord.ui.View):
+    def __init__(self):
+        super().__init__(timeout=None); self.add_item(ResignationButton())
+
+class ResignationReviewView(discord.ui.View):
+    def __init__(self, member_id):
+        super().__init__(timeout=None); self.member_id=member_id
+        a=discord.ui.Button(label="قبول",style=discord.ButtonStyle.success); r=discord.ui.Button(label="رفض",style=discord.ButtonStyle.danger)
+        a.callback=self.accept; r.callback=self.reject; self.add_item(a); self.add_item(r)
+    async def accept(self, interaction):
+        if not await admin_allowed(interaction): return
+        member=interaction.guild.get_member(self.member_id)
+        if not member:
+            try: member=await interaction.guild.fetch_member(self.member_id)
+            except discord.HTTPException: member=None
+        if not member: return await interaction.response.send_message("ما قدرت ألقى الموظف.",ephemeral=True)
+        await interaction.response.defer(ephemeral=True)
+        worked=await end_employee_membership(interaction,member,"استقالة")
+        if interaction.message:
+            e=interaction.message.embeds[0]; e.add_field(name="الحالة",value=f"مقبولة بواسطة {interaction.user.mention}",inline=False); await interaction.message.edit(embed=e,view=None)
+        try: await member.send("تم قبول استقالتك من **Bean Machine**.")
+        except discord.HTTPException: pass
+        await send_admin_log(interaction,"قبول استقالة",f"الموظف: {member.mention}" + (f"\nتم إنهاء الدوام: {worked}" if worked else ""))
+        await interaction.followup.send("تم قبول الاستقالة وإزالة الرتب وحذف البيانات الوظيفية.",ephemeral=True)
+    async def reject(self, interaction):
+        if not await admin_allowed(interaction): return
+        if interaction.message:
+            e=interaction.message.embeds[0]; e.add_field(name="الحالة",value=f"مرفوضة بواسطة {interaction.user.mention}",inline=False); await interaction.message.edit(embed=e,view=None)
+        await interaction.response.send_message("تم رفض الاستقالة.",ephemeral=True)
+
+
+class EmployeeSearchModal(discord.ui.Modal):
+    def __init__(self):
+        super().__init__(title="بحث عن موظف")
+        self.query=discord.ui.TextInput(label="البحث",placeholder="اسم اللعبة / رقم الجوال / Citizen ID / Discord ID",required=True,max_length=100)
+        self.add_item(self.query)
+    async def on_submit(self, interaction):
+        if not await admin_allowed(interaction): return
+        rows=await search_employee_profiles(interaction.guild.id,self.query.value)
+        if not rows: return await interaction.response.send_message("لم يتم العثور على موظف.",ephemeral=True)
+        embeds=[]
+        for uid,name,phone,citizen,hired,status in rows[:10]:
+            stats=await get_employee_stats(interaction.guild.id,uid)
+            points,seconds,invoices,tasks=stats
+            e=discord.Embed(title=f"بيانات الموظف - {name}")
+            e.add_field(name="Discord",value=f"<@{uid}> (`{uid}`)",inline=False)
+            e.add_field(name="الحالة",value="موظف",inline=True); e.add_field(name="اسم اللعبة",value=name,inline=True)
+            e.add_field(name="رقم الجوال",value=phone,inline=True); e.add_field(name="Citizen ID",value=citizen,inline=True)
+            e.add_field(name="تاريخ التوظيف",value=f"<t:{int(datetime.fromisoformat(hired).timestamp())}:D>",inline=True)
+            e.add_field(name="النقاط",value=format_points(points),inline=True); e.add_field(name="ساعات العمل",value=format_duration(seconds),inline=True)
+            e.add_field(name="الفواتير",value=str(invoices),inline=True); e.add_field(name="المهام",value=str(tasks),inline=True)
+            embeds.append(e)
+        await interaction.response.send_message(embeds=embeds,ephemeral=True)
+
+class EmployeeDatabaseView(discord.ui.View):
+    def __init__(self):
+        super().__init__(timeout=None)
+    @discord.ui.button(label="بحث عن موظف",style=discord.ButtonStyle.primary,custom_id="db:search")
+    async def search(self,interaction,button):
+        if not await admin_allowed(interaction): return
+        await interaction.response.send_modal(EmployeeSearchModal())
+    @discord.ui.button(label="عرض جميع الموظفين",style=discord.ButtonStyle.secondary,custom_id="db:list")
+    async def list_all(self,interaction,button):
+        if not await admin_allowed(interaction): return
+        rows=await list_employee_profiles(interaction.guild.id)
+        if not rows: return await interaction.response.send_message("لا يوجد موظفون حاليًا.",ephemeral=True)
+        chunks=[]
+        for start in range(0,len(rows),10):
+            lines=[]
+            for i,(uid,name,phone,citizen,hired,status) in enumerate(rows[start:start+10],start+1):
+                lines.append(f"**{i}. {name}** — <@{uid}>\n`{phone}` | `{citizen}`")
+            chunks.append(discord.Embed(title=f"الموظفون الحاليون ({len(rows)})",description="\n\n".join(lines)))
+        await interaction.response.send_message(embeds=chunks[:10],ephemeral=True)
+    @discord.ui.button(label="تحديث",style=discord.ButtonStyle.success,custom_id="db:refresh")
+    async def refresh(self,interaction,button):
+        if not await admin_allowed(interaction): return
+        rows=await list_employee_profiles(interaction.guild.id)
+        embed=discord.Embed(title="قاعدة بيانات الموظفين",description=f"إجمالي الموظفين الحاليين: **{len(rows)}**\n\nاستخدم الأزرار بالأسفل للبحث أو عرض الموظفين.",timestamp=datetime.now(timezone.utc))
+        await interaction.response.edit_message(embed=embed,view=self)
+
 class OtherPanelButton(discord.ui.Button):
     def __init__(self, label, custom_id):
         super().__init__(label=label, style=discord.ButtonStyle.primary, custom_id=custom_id)
@@ -1104,7 +1287,7 @@ class OtherPanelButton(discord.ui.Button):
 
 class PanelSelect(discord.ui.Select):
     def __init__(self):
-        options = [discord.SelectOption(label="لوحة التقديم",value="application",emoji="📝"), discord.SelectOption(label="لوحة الإجازات",value="vacation",emoji="🏖️"), discord.SelectOption(label="لوحة الموارد البشرية",value="hr",emoji="👥")]
+        options = [discord.SelectOption(label="لوحة التقديم",value="application",emoji="📝"), discord.SelectOption(label="لوحة الإجازات",value="vacation",emoji="🏖️"), discord.SelectOption(label="لوحة الموارد البشرية",value="hr",emoji="👥"), discord.SelectOption(label="لوحة الاستقالات",value="resignation"), discord.SelectOption(label="قاعدة الموظفين",value="employee_db")]
         super().__init__(placeholder="اختر اللوحة", options=options)
     async def callback(self, interaction):
         selected = self.values[0]
@@ -1164,6 +1347,21 @@ class PanelSelect(discord.ui.Select):
                 ephemeral=True
             )
 
+        if selected == "resignation":
+            await interaction.channel.send(embed=discord.Embed(title="نظام الاستقالات", description="من خلال هذه اللوحة يمكن للموظف تقديم طلب استقالة ليتم مراجعته من الإدارة."), view=ResignationPanelView())
+            return await interaction.response.send_message("تم إرسال لوحة الاستقالات.", ephemeral=True)
+
+        if selected == "employee_db":
+            if not await admin_allowed(interaction): return
+            channel_id = await get_setting(interaction.guild.id, "employee_database_channel")
+            target = interaction.guild.get_channel(int(channel_id)) if channel_id else None
+            if not isinstance(target, discord.TextChannel):
+                return await interaction.response.send_message("روم قاعدة بيانات الموظفين غير محدد. اضبطه من `/settings`.", ephemeral=True)
+            rows = await list_employee_profiles(interaction.guild.id)
+            embed = discord.Embed(title="قاعدة بيانات الموظفين", description=f"إجمالي الموظفين الحاليين: **{len(rows)}**\n\nاستخدم الأزرار بالأسفل للبحث أو عرض الموظفين.", timestamp=datetime.now(timezone.utc))
+            await target.send(embed=embed, view=EmployeeDatabaseView())
+            return await interaction.response.send_message(f"تم إرسال قاعدة الموظفين في {target.mention}.", ephemeral=True)
+
         await interaction.channel.send(
             embed=discord.Embed(
                 title="الموارد البشرية",
@@ -1194,10 +1392,10 @@ class PanelSelect(discord.ui.Select):
 class Panels(commands.Cog):
     def __init__(self, bot):
         self.bot=bot
-        bot.add_view(EmployeePanel()); bot.add_view(AdminPanel()); bot.add_view(ApplicationPanelView()); bot.add_view(TicketControlView()); bot.add_view(VacationPanelView()); bot.add_view(HRPanelView())
+        bot.add_view(EmployeePanel()); bot.add_view(AdminPanel()); bot.add_view(ApplicationPanelView()); bot.add_view(TicketControlView()); bot.add_view(VacationPanelView()); bot.add_view(HRPanelView()); bot.add_view(ResignationPanelView()); bot.add_view(EmployeeDatabaseView())
     @app_commands.command(name="لوحة-الادارة",description="إرسال لوحة تحكم الإدارة")
-    @app_commands.default_permissions(administrator=True)
     async def admin_panel(self,interaction):
+        if not await admin_allowed(interaction): return
         await interaction.channel.send(embed=discord.Embed(
             title="⚙️ | لوحة تحكم الإدارة",
             description="""من خلال هذه اللوحة يمكنك إدارة دوام الموظفين ونقاطهم ومتابعة إحصائياتهم.
@@ -1229,12 +1427,15 @@ class Panels(commands.Cog):
 🗑️ **تصفير موظف**
 تصفير نقاط موظف محدد فقط.
 
-**تنبيه:** عمليات زيادة وخصم وتصفير النقاط والخروج الإجباري يتم تسجيلها في لوق الإدارة."""
+🛑 **فصل موظف**
+اختيار موظف وكتابة رسالة الإدارة، ثم إزالة رتب الموظف والإجازة وحذف بياناته الوظيفية.
+
+**تنبيه:** عمليات زيادة وخصم وتصفير النقاط والخروج الإجباري والفصل يتم تسجيلها في لوق الإدارة."""
         ),view=AdminPanel())
         await interaction.response.send_message("تم إرسال لوحة الإدارة.",ephemeral=True)
     @app_commands.command(name="لوحة-الموظفين",description="إرسال لوحة تحكم الموظفين")
-    @app_commands.default_permissions(administrator=True)
     async def employee_panel(self,interaction):
+        if not await admin_allowed(interaction): return
         await interaction.channel.send(embed=discord.Embed(
             title="🍽️ | لوحة الموظفين",
             description="""من خلال هذه اللوحة يمكنك إدارة دوامك وفواتيرك ومتابعة نقاطك.
@@ -1258,8 +1459,8 @@ class Panels(commands.Cog):
         ),view=EmployeePanel())
         await interaction.response.send_message("تم إرسال لوحة الموظفين.",ephemeral=True)
     @app_commands.command(name="اللوحات",description="إرسال باقي لوحات البوت")
-    @app_commands.default_permissions(administrator=True)
     async def panels(self,interaction):
+        if not await admin_allowed(interaction): return
         view=discord.ui.View(timeout=120); view.add_item(PanelSelect())
         await interaction.response.send_message("اختر اللوحة التي تريد إرسالها:",view=view,ephemeral=True)
 
