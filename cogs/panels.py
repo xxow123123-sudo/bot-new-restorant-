@@ -1,4 +1,3 @@
-from cogs.external_applications import JoinApplicationButton
 from datetime import datetime, timezone
 import asyncio
 from io import BytesIO
@@ -351,6 +350,25 @@ class ConfirmResetAllView(discord.ui.View):
     async def cancel(self, interaction, button):
         await interaction.response.edit_message(content="تم إلغاء العملية.", view=None)
 
+class AdminDMModal(discord.ui.Modal):
+    def __init__(self):
+        super().__init__(title="إرسال رسالة لعضو")
+        self.uid=discord.ui.TextInput(label="Discord User ID",required=True,max_length=22)
+        self.msg=discord.ui.TextInput(label="الرسالة",style=discord.TextStyle.paragraph,required=True,max_length=1500)
+        self.add_item(self.uid);self.add_item(self.msg)
+    async def on_submit(self,interaction):
+        if not await admin_allowed(interaction):return
+        try: uid=int(str(self.uid.value).strip())
+        except ValueError:return await interaction.response.send_message("User ID غير صحيح.",ephemeral=True)
+        try: target=interaction.guild.get_member(uid) or await interaction.client.fetch_user(uid);await target.send(embed=discord.Embed(title="☕ رسالة من إدارة Bean Machine",description=self.msg.value,timestamp=datetime.now(timezone.utc)))
+        except (discord.Forbidden,discord.HTTPException):return await interaction.response.send_message("تعذر إرسال الرسالة؛ قد يكون الخاص مقفلًا.",ephemeral=True)
+        await interaction.response.send_message(f"تم إرسال الرسالة إلى <@{uid}>.",ephemeral=True);await send_admin_log(interaction,"✉️ رسالة خاصة لعضو",f"العضو: <@{uid}> (`{uid}`)\nالرسالة:\n{self.msg.value}")
+class AdminDMButton(discord.ui.Button):
+    def __init__(self):super().__init__(label="إرسال رسالة لعضو",emoji="✉️",style=discord.ButtonStyle.primary,custom_id="admin:send_dm")
+    async def callback(self,interaction):
+        if not await admin_allowed(interaction):return
+        await interaction.response.send_modal(AdminDMModal())
+
 class AdminPanel(discord.ui.View):
     def __init__(self):
         super().__init__(timeout=None)
@@ -364,6 +382,7 @@ class AdminPanel(discord.ui.View):
         self.add_item(AdminButton("تصفير الجميع","admin:reset_all","reset_all",discord.ButtonStyle.danger))
         self.add_item(AdminButton("تصفير موظف","admin:reset_one","reset",discord.ButtonStyle.danger))
         self.add_item(AdminButton("فصل موظف","admin:fire_employee","fire",discord.ButtonStyle.danger))
+        self.add_item(AdminDMButton())
 
 class ApplicationModal(discord.ui.Modal):
     def __init__(self):
@@ -468,7 +487,6 @@ class ApplicationPanelView(discord.ui.View):
     def __init__(self):
         super().__init__(timeout=None)
         self.add_item(ApplicationButton())
-        self.add_item(JoinApplicationButton())
 
 
 class ConfirmCloseTicketView(discord.ui.View):
@@ -1317,33 +1335,9 @@ class PanelSelect(discord.ui.Select):
         selected = self.values[0]
 
         if selected == "application":
-            await interaction.channel.send(
-                embed=discord.Embed(
-                    title="📝 | التقديم على المطعم",
-                    description="""أهلًا وسهلًا بك في نظام التقديم الخاص بالمطعم.
-
-إذا كنت ترغب بالانضمام إلى فريق العمل، يرجى قراءة **قوانين العمل وطريقة العمل بالكامل** قبل البدء بالتقديم، والتأكد من قدرتك على الالتزام بالدوام والمهام المطلوبة منك.
-
-عند الضغط على زر **📝 تقديم** سيظهر لك استبيان يحتوي على مجموعة من الأسئلة، يرجى الإجابة عليها **بشكل واضح وصحيح** لأن إجاباتك سيتم مراجعتها من قِبل الإدارة.
-
-**الاستبيان يحتوي على:**
-الاسم، العمر، سبب التقديم، عدد الساعات التي تستطيع العمل بها يوميًا، والتأكيد على قراءة قوانين وطريقة العمل.
-
-بعد إرسال الطلب سيتم تحويله إلى **الإدارة للمراجعة**، وفي حال قبول طلبك سيتم فتح **تذكرة خاصة** بينك وبين الإدارة لاستكمال إجراءات التوظيف.
-
-إذا قدمت عبر موقع Bean Machine وتم قبولك، استخدم زر **طلب انضمام** وأدخل رقم القبول الذي ظهر لك في الموقع.
-
-**تنبيهات مهمة**
-يرجى عدم إرسال أكثر من طلب، وعدم الاستعجال أو سؤال الإدارة عن حالة تقديمك. تأكد من صحة جميع المعلومات قبل إرسال الطلب.
-
-**نتمنى لك التوفيق 🤍**"""
-                ),
-                view=ApplicationPanelView()
-            )
-            return await interaction.response.send_message(
-                "تم إرسال لوحة التقديم.",
-                ephemeral=True
-            )
+            from cogs.web_applications import ApplicationFollowupView
+            await interaction.channel.send(embed=discord.Embed(title="📋 | متابعة التقديم", description="التقديم يتم بالكامل من موقع Bean Machine. بعد إرسال الطلب ادخل السيرفر واضغط **📋 متابعة طلبي**. البوت يتعرف على Discord ID تلقائيًا بدون رمز. إذا تم قبولك مبدئيًا ستظهر لك لوحة الموارد البشرية مباشرة."), view=ApplicationFollowupView())
+            return await interaction.response.send_message("تم إرسال لوحة متابعة التقديم.", ephemeral=True)
 
         if selected == "vacation":
             await interaction.channel.send(

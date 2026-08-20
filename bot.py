@@ -17,12 +17,14 @@ class RestaurantBot(commands.Bot):
 
     async def setup_hook(self):
         await init_db()
+        self.web_runner = await start_web_server(self, PORT)
+        print(f"✅ Website running on port {PORT}")
 
         for ext in (
             "cogs.settings",
             "cogs.panels",
             "cogs.bot_profile",
-            "cogs.external_applications",
+            "cogs.web_applications",
         ):
             await self.load_extension(ext)
             print(f"✅ Loaded: {ext}")
@@ -43,9 +45,6 @@ bot = RestaurantBot()
 @bot.event
 async def on_ready():
     print(f"✅ Logged in as {bot.user}")
-    if getattr(bot, "web_runner", None) is None:
-        bot.web_runner = await start_web_server(bot, PORT)
-        print(f"✅ Website running on port {PORT}")
 
 
 async def main():
