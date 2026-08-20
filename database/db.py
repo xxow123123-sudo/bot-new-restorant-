@@ -70,6 +70,30 @@ CREATE TABLE IF NOT EXISTS employee_departures (
     departed_at TEXT NOT NULL,
     admin_id INTEGER
 );
+
+CREATE TABLE IF NOT EXISTS external_applications (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    guild_id INTEGER NOT NULL,
+    discord_id INTEGER NOT NULL,
+    reason TEXT NOT NULL,
+    daily_hours TEXT NOT NULL,
+    availability TEXT NOT NULL,
+    previous_experience TEXT NOT NULL,
+    difficult_customer TEXT NOT NULL,
+    uniform_commitment TEXT NOT NULL,
+    rules_agreement TEXT NOT NULL,
+    status TEXT NOT NULL DEFAULT 'pending',
+    tracking_token TEXT NOT NULL UNIQUE,
+    acceptance_code TEXT UNIQUE,
+    used_by INTEGER,
+    created_at TEXT NOT NULL,
+    reviewed_at TEXT,
+    reviewed_by INTEGER
+);
+
+CREATE INDEX IF NOT EXISTS idx_external_applications_discord
+ON external_applications(guild_id, discord_id);
+
 """
 
 async def init_db():
@@ -380,4 +404,115 @@ async def remove_employee_profile(guild_id: int, user_id: int, departure_type: s
     async with aiosqlite.connect(DB_PATH) as db:
         await db.execute("DELETE FROM employee_profiles WHERE guild_id=? AND user_id=?", (guild_id,user_id))
         await db.execute("INSERT INTO employee_departures (guild_id,user_id,departure_type,departed_at,admin_id) VALUES (?,?,?,?,?)", (guild_id,user_id,departure_type,departed_at,admin_id))
+        await db.commit()
+
+# =========================================================
+# External website applications (independent from employees)
+# =========================================================
+
+async def create_external_application(guild_id: int, discord_id: int, answers: dict, tracking_token: str, created_at: str):
+    async with aiosqlite.connect(DB_PATH) as db:
+        cur = await db.execute(
+            """INSERT INTO external_applications
+            (guild_id, discord_id, reason, daily_hours, availability, previous_experience,
+             difficult_customer, uniform_commitment, rules_agreement, status, tracking_token, created_at)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, 'pending', ?, ?)""",
+            (
+                guild_id, discord_id, answers["reason"], answers["daily_hours"], answers["availability"],
+                answers["previous_experience"], answers["difficult_customer"], answers["uniform_commitment"],
+                answers["rules_agreement"], tracking_token, created_at
+            )
+        )
+        await db.commit()
+        return cur.lastrowid
+
+async def get_external_application(application_id: int):
+    async with aiosqlite.connect(DB_PATH) as db:
+        cur = await db.execute(
+            "SELECT * FROM external_applications WHERE id=?",
+            (application_id,)
+        )
+        return await cur.fetchone()
+
+async def get_external_application_by_token(tracking_token: str):
+    async with aiosqlite.connect(DB_PATH) as db:
+        cur = await db.execute(
+            "SELECT * FROM external_applications WHERE tracking_token=?",
+            (tracking_token,)
+        )
+        return await cur.fetchone()
+
+async def get_pending_external_applications():
+    async with aiosqlite.connect(DB_PATH) as db:
+        cur = await db.execute(
+            "SELECT id FROM external_applications WHERE status='pending' ORDER BY id ASC"
+        )
+        return await cur.fetchall()
+
+async def get_open_external_application_for_discord(guild_id: int, discord_id: int):
+    async with aiosqlite.connect(DB_PATH) as db:
+        cur = await db.execute(
+            """SELECT * FROM external_applications
+               WHERE guild_id=? AND discord_id=? AND status IN ('pending','accepted','redeemed')
+               ORDER BY id DESC LIMIT 1""",
+            (guild_id, discord_id)
+        )
+        return await cur.fetchone()
+
+async def set_external_application_status(application_id: int, status: str, reviewed_at: str, reviewed_by: int, acceptance_code=None):
+    async with aiosqlite.connect(DB_PATH) as db:
+        await db.execute(
+            """UPDATE external_applications
+               SET status=?, reviewed_at=?, reviewed_by=?, acceptance_code=COALESCE(?, acceptance_code)
+               WHERE id=?""",
+            (status, reviewed_at, reviewed_by, acceptance_code, application_id)
+        )
+        await db.commit()
+
+async def claim_acceptance_code(guild_id: int, acceptance_code: str, discord_id: int):
+    """Reserve a one-time acceptance code for the matching Discord account."""
+    async with aiosqlite.connect(DB_PATH) as db:
+        await db.execute("BEGIN IMMEDIATE")
+        cur = await db.execute(
+            """SELECT id, status, used_by FROM external_applications
+               WHERE guild_id=? AND acceptance_code=? AND discord_id=?""",
+            (guild_id, acceptance_code, discord_id)
+        )
+        row = await cur.fetchone()
+        if not row:
+            await db.rollback()
+            return None, "invalid"
+        app_id, status, used_by = row
+        if status != "accepted":
+            await db.rollback()
+            return None, "not_accepted"
+        if used_by is not None:
+            await db.rollback()
+            return None, "used"
+        await db.execute(
+            "UPDATE external_applications SET used_by=? WHERE id=? AND used_by IS NULL",
+            (discord_id, app_id)
+        )
+        await db.commit()
+        return app_id, "ok"
+
+async def release_acceptance_code(application_id: int, discord_id: int):
+    async with aiosqlite.connect(DB_PATH) as db:
+        await db.execute(
+            "UPDATE external_applications SET used_by=NULL WHERE id=? AND used_by=? AND status='accepted'",
+            (application_id, discord_id)
+        )
+        await db.commit()
+
+async def finalize_acceptance_code(application_id: int, discord_id: int):
+    async with aiosqlite.connect(DB_PATH) as db:
+        await db.execute(
+            "UPDATE external_applications SET status='redeemed' WHERE id=? AND used_by=? AND status='accepted'",
+            (application_id, discord_id)
+        )
+        await db.commit()
+
+async def delete_external_application(application_id: int):
+    async with aiosqlite.connect(DB_PATH) as db:
+        await db.execute("DELETE FROM external_applications WHERE id=?", (application_id,))
         await db.commit()

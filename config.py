@@ -6,3 +6,6 @@ load_dotenv()
 TOKEN = os.getenv("DISCORD_TOKEN", "")
 GUILD_ID = int(os.getenv("GUILD_ID", "0") or 0)
 DB_PATH = "restaurant_bot.db"
+
+DISCORD_INVITE_URL = os.getenv("DISCORD_INVITE_URL", "")
+PORT = int(os.getenv("PORT", "8080") or 8080)

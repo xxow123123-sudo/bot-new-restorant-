@@ -1,3 +1,4 @@
+from cogs.external_applications import JoinApplicationButton
 from datetime import datetime, timezone
 import asyncio
 from io import BytesIO
@@ -467,6 +468,7 @@ class ApplicationPanelView(discord.ui.View):
     def __init__(self):
         super().__init__(timeout=None)
         self.add_item(ApplicationButton())
+        self.add_item(JoinApplicationButton())
 
 
 class ConfirmCloseTicketView(discord.ui.View):
@@ -1328,6 +1330,8 @@ class PanelSelect(discord.ui.Select):
 الاسم، العمر، سبب التقديم، عدد الساعات التي تستطيع العمل بها يوميًا، والتأكيد على قراءة قوانين وطريقة العمل.
 
 بعد إرسال الطلب سيتم تحويله إلى **الإدارة للمراجعة**، وفي حال قبول طلبك سيتم فتح **تذكرة خاصة** بينك وبين الإدارة لاستكمال إجراءات التوظيف.
+
+إذا قدمت عبر موقع Bean Machine وتم قبولك، استخدم زر **طلب انضمام** وأدخل رقم القبول الذي ظهر لك في الموقع.
 
 **تنبيهات مهمة**
 يرجى عدم إرسال أكثر من طلب، وعدم الاستعجال أو سؤال الإدارة عن حالة تقديمك. تأكد من صحة جميع المعلومات قبل إرسال الطلب.

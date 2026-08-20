@@ -1,8 +1,9 @@
 import asyncio
 import discord
 from discord.ext import commands
-from config import TOKEN, GUILD_ID
+from config import TOKEN, GUILD_ID, PORT
 from database.db import init_db
+from web_app import start_web_server
 
 INTENTS = discord.Intents.default()
 INTENTS.guilds = True
@@ -21,6 +22,7 @@ class RestaurantBot(commands.Bot):
             "cogs.settings",
             "cogs.panels",
             "cogs.bot_profile",
+            "cogs.external_applications",
         ):
             await self.load_extension(ext)
             print(f"✅ Loaded: {ext}")
@@ -41,6 +43,9 @@ bot = RestaurantBot()
 @bot.event
 async def on_ready():
     print(f"✅ Logged in as {bot.user}")
+    if getattr(bot, "web_runner", None) is None:
+        bot.web_runner = await start_web_server(bot, PORT)
+        print(f"✅ Website running on port {PORT}")
 
 
 async def main():
