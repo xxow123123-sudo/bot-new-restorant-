@@ -369,6 +369,193 @@ class AdminDMButton(discord.ui.Button):
         if not await admin_allowed(interaction):return
         await interaction.response.send_modal(AdminDMModal())
 
+
+class AdminEmployeeProfileModal(discord.ui.Modal):
+    def __init__(self, user_id: int, current_profile=None):
+        title = "تعديل بيانات موظف" if current_profile else "تسجيل بيانات موظف"
+        super().__init__(title=title)
+        self.user_id = user_id
+        self.current_profile = current_profile
+
+        game_default = current_profile[1] if current_profile else None
+        phone_default = current_profile[2] if current_profile else None
+        citizen_default = current_profile[3] if current_profile else None
+
+        self.game_name = discord.ui.TextInput(
+            label="الاسم داخل اللعبة",
+            placeholder="اكتب اسم الموظف داخل اللعبة",
+            required=True,
+            max_length=100,
+            default=game_default
+        )
+        self.phone_number = discord.ui.TextInput(
+            label="رقم الجوال داخل اللعبة",
+            placeholder="اكتب رقم الجوال",
+            required=True,
+            max_length=50,
+            default=phone_default
+        )
+        self.citizen_id = discord.ui.TextInput(
+            label="Citizen ID",
+            placeholder="اكتب Citizen ID",
+            required=True,
+            max_length=100,
+            default=citizen_default
+        )
+
+        self.add_item(self.game_name)
+        self.add_item(self.phone_number)
+        self.add_item(self.citizen_id)
+
+    async def on_submit(self, interaction: discord.Interaction):
+        if not await admin_allowed(interaction):
+            return
+
+        existing = await get_employee_profile(interaction.guild.id, self.user_id)
+        hired_at = existing[4] if existing else datetime.now(timezone.utc).isoformat()
+
+        await save_employee_profile(
+            interaction.guild.id,
+            self.user_id,
+            self.game_name.value,
+            self.phone_number.value,
+            self.citizen_id.value,
+            hired_at
+        )
+
+        # إذا كان تسجيل جديد، نحاول إعطاء رتبة الموظف مثل قبول الموارد البشرية.
+        role_note = ""
+        member = interaction.guild.get_member(self.user_id)
+        if member is None:
+            try:
+                member = await interaction.guild.fetch_member(self.user_id)
+            except discord.HTTPException:
+                member = None
+
+        if not existing and member:
+            role_id = await get_setting(interaction.guild.id, "employee_role")
+            role = interaction.guild.get_role(int(role_id)) if role_id else None
+            if role and role not in member.roles:
+                try:
+                    await member.add_roles(
+                        role,
+                        reason=f"تسجيل يدوي في الموارد البشرية بواسطة {interaction.user}"
+                    )
+                    role_note = f"\nتم إعطاؤه رتبة الموظف {role.mention}."
+                except (discord.Forbidden, discord.HTTPException):
+                    role_note = "\nتم حفظ البيانات، لكن تعذر إعطاء رتبة الموظف."
+
+        action = "تعديل" if existing else "تسجيل"
+        await interaction.response.send_message(
+            f"✅ تم **{action} بيانات الموظف** <@{self.user_id}> بنجاح.{role_note}",
+            ephemeral=True
+        )
+
+        await send_admin_log(
+            interaction,
+            f"👥 {action} بيانات موظف",
+            (
+                f"الموظف: <@{self.user_id}> (`{self.user_id}`)\n"
+                f"الاسم داخل اللعبة: {self.game_name.value}\n"
+                f"رقم الجوال: {self.phone_number.value}\n"
+                f"Citizen ID: {self.citizen_id.value}"
+            )
+        )
+
+
+class AdminEmployeeProfileActionView(discord.ui.View):
+    def __init__(self, user_id: int, profile):
+        super().__init__(timeout=120)
+        self.user_id = user_id
+        self.profile = profile
+
+    @discord.ui.button(label="تعديل البيانات", emoji="✏️", style=discord.ButtonStyle.primary)
+    async def edit_profile(self, interaction: discord.Interaction, button: discord.ui.Button):
+        if not await admin_allowed(interaction):
+            return
+        await interaction.response.send_modal(
+            AdminEmployeeProfileModal(self.user_id, self.profile)
+        )
+
+
+class AdminEmployeeProfileCreateView(discord.ui.View):
+    def __init__(self, user_id: int):
+        super().__init__(timeout=120)
+        self.user_id = user_id
+
+    @discord.ui.button(label="تسجيل بيانات جديدة", emoji="➕", style=discord.ButtonStyle.success)
+    async def create_profile(self, interaction: discord.Interaction, button: discord.ui.Button):
+        if not await admin_allowed(interaction):
+            return
+        await interaction.response.send_modal(
+            AdminEmployeeProfileModal(self.user_id, None)
+        )
+
+
+class AdminEmployeeLookupModal(discord.ui.Modal):
+    def __init__(self):
+        super().__init__(title="إدارة بيانات موظف")
+        self.user_id = discord.ui.TextInput(
+            label="Discord User ID",
+            placeholder="الصق Copy User ID هنا",
+            required=True,
+            max_length=22
+        )
+        self.add_item(self.user_id)
+
+    async def on_submit(self, interaction: discord.Interaction):
+        if not await admin_allowed(interaction):
+            return
+
+        try:
+            uid = int(str(self.user_id.value).strip())
+        except ValueError:
+            return await interaction.response.send_message(
+                "User ID غير صحيح.",
+                ephemeral=True
+            )
+
+        profile = await get_employee_profile(interaction.guild.id, uid)
+
+        if profile:
+            _, game_name, phone, citizen_id, hired_at, status = profile
+            embed = discord.Embed(
+                title="👥 بيانات الموظف الحالية",
+                description=f"<@{uid}> (`{uid}`)"
+            )
+            embed.add_field(name="الاسم داخل اللعبة", value=game_name, inline=False)
+            embed.add_field(name="رقم الجوال", value=phone, inline=True)
+            embed.add_field(name="Citizen ID", value=citizen_id, inline=True)
+            embed.add_field(name="الحالة", value=status, inline=True)
+            await interaction.response.send_message(
+                embed=embed,
+                view=AdminEmployeeProfileActionView(uid, profile),
+                ephemeral=True
+            )
+        else:
+            await interaction.response.send_message(
+                f"لا توجد بيانات موارد بشرية مسجلة لـ <@{uid}> (`{uid}`).\n"
+                "اضغط الزر بالأسفل لتسجيل بياناته كموظف جديد.",
+                view=AdminEmployeeProfileCreateView(uid),
+                ephemeral=True
+            )
+
+
+class AdminEmployeeProfileButton(discord.ui.Button):
+    def __init__(self):
+        super().__init__(
+            label="إدارة بيانات موظف",
+            emoji="👥",
+            style=discord.ButtonStyle.secondary,
+            custom_id="admin:employee_profile"
+        )
+
+    async def callback(self, interaction: discord.Interaction):
+        if not await admin_allowed(interaction):
+            return
+        await interaction.response.send_modal(AdminEmployeeLookupModal())
+
+
 class AdminPanel(discord.ui.View):
     def __init__(self):
         super().__init__(timeout=None)
@@ -383,6 +570,7 @@ class AdminPanel(discord.ui.View):
         self.add_item(AdminButton("تصفير موظف","admin:reset_one","reset",discord.ButtonStyle.danger))
         self.add_item(AdminButton("فصل موظف","admin:fire_employee","fire",discord.ButtonStyle.danger))
         self.add_item(AdminDMButton())
+        self.add_item(AdminEmployeeProfileButton())
 
 class ApplicationModal(discord.ui.Modal):
     def __init__(self):
