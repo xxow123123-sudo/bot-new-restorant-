@@ -2,6 +2,7 @@ from datetime import datetime, timezone
 import asyncio
 from io import BytesIO
 import discord
+import openpyxl
 from discord import app_commands
 from discord.ext import commands
 
@@ -801,6 +802,39 @@ class AdminEmployeeProfileButton(discord.ui.Button):
         await interaction.response.send_modal(AdminEmployeeLookupModal())
 
 
+
+class BulkEmployeeImportButton(discord.ui.Button):
+    def __init__(self):
+        super().__init__(label="إضافة مجموعة موظفين", emoji="📥", style=discord.ButtonStyle.success, custom_id="admin:bulk_employee_import")
+
+    async def callback(self, interaction: discord.Interaction):
+        if not await admin_allowed(interaction):
+            return
+        await interaction.response.send_message("📥 ارفع ملف Excel الآن (.xlsx) خلال دقيقتين. الأعمدة المطلوبة: Discord ID | اسم الموظف داخل اللعبة | رقم الموظف | Citizen ID", ephemeral=True)
+        def check(m):
+            return m.author.id == interaction.user.id and m.channel.id == interaction.channel_id and m.attachments and m.attachments[0].filename.endswith('.xlsx')
+        try:
+            msg = await interaction.client.wait_for('message', timeout=120, check=check)
+            data = await msg.attachments[0].read()
+            import tempfile
+            with tempfile.NamedTemporaryFile(suffix='.xlsx') as f:
+                f.write(data); f.flush()
+                wb = openpyxl.load_workbook(f.name)
+                ws = wb.active
+                added = 0; skipped = 0
+                for row in ws.iter_rows(min_row=2, values_only=True):
+                    uid, game_name, number, citizen = row[:4]
+                    if not uid or not game_name or not number or not citizen:
+                        continue
+                    try:
+                        await save_employee_profile(interaction.guild.id, int(uid), str(game_name), str(number), str(citizen), datetime.now().strftime('%Y-%m-%d'))
+                        added += 1
+                    except Exception:
+                        skipped += 1
+            await interaction.followup.send(f"✅ تم استيراد الموظفين\n\nتمت الإضافة: {added}\nتم التخطي: {skipped}", ephemeral=True)
+        except asyncio.TimeoutError:
+            await interaction.followup.send("انتهى الوقت.", ephemeral=True)
+
 class AdminPanel(discord.ui.View):
     def __init__(self):
         super().__init__(timeout=None)
@@ -818,6 +852,7 @@ class AdminPanel(discord.ui.View):
         self.add_item(OpenMemberTicketButton())
         self.add_item(AdminDMButton())
         self.add_item(AdminEmployeeProfileButton())
+        self.add_item(BulkEmployeeImportButton())
 
 class ApplicationModal(discord.ui.Modal):
     def __init__(self):
