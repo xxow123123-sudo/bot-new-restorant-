@@ -71,6 +71,22 @@ CREATE TABLE IF NOT EXISTS employee_departures (
     departed_at TEXT NOT NULL,
     admin_id INTEGER
 );
+
+CREATE TABLE IF NOT EXISTS web_applications (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    guild_id INTEGER NOT NULL,
+    user_id INTEGER NOT NULL,
+    reason TEXT NOT NULL,
+    daily_hours TEXT NOT NULL,
+    availability TEXT NOT NULL,
+    previous_experience TEXT NOT NULL,
+    difficult_customer TEXT NOT NULL,
+    uniform_commitment TEXT NOT NULL,
+    rules_agreement TEXT NOT NULL,
+    status TEXT NOT NULL DEFAULT 'pending',
+    token TEXT NOT NULL UNIQUE,
+    created_at TEXT NOT NULL
+);
 """
 
 async def init_db():
@@ -82,6 +98,44 @@ async def init_db():
         if "forced_checkout_count" not in columns:
             await db.execute("ALTER TABLE employees ADD COLUMN forced_checkout_count INTEGER NOT NULL DEFAULT 0")
         await db.commit()
+
+
+async def create_web_application(guild_id: int, user_id: int, answers: dict, token: str, created_at: str):
+    async with aiosqlite.connect(DB_PATH) as db:
+        cur = await db.execute(
+            "INSERT INTO web_applications "
+            "(guild_id,user_id,reason,daily_hours,availability,previous_experience,"
+            "difficult_customer,uniform_commitment,rules_agreement,status,token,created_at) "
+            "VALUES (?,?,?,?,?,?,?,?,?,'pending',?,?)",
+            (
+                guild_id,
+                user_id,
+                answers.get("reason", ""),
+                answers.get("daily_hours", ""),
+                answers.get("availability", ""),
+                answers.get("previous_experience", ""),
+                answers.get("difficult_customer", ""),
+                answers.get("uniform_commitment", ""),
+                answers.get("rules_agreement", ""),
+                token,
+                created_at,
+            ),
+        )
+        await db.commit()
+        return cur.lastrowid
+
+
+async def get_web_application_by_token(token: str):
+    async with aiosqlite.connect(DB_PATH) as db:
+        cur = await db.execute(
+            "SELECT id,guild_id,user_id,reason,daily_hours,availability,"
+            "previous_experience,difficult_customer,uniform_commitment,"
+            "rules_agreement,status,token,created_at "
+            "FROM web_applications WHERE token=? LIMIT 1",
+            (token,),
+        )
+        return await cur.fetchone()
+
 
 async def set_setting(guild_id: int, key: str, value: str):
     async with aiosqlite.connect(DB_PATH) as db:
