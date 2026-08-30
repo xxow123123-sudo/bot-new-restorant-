@@ -220,9 +220,48 @@ class MemberPicker(discord.ui.UserSelect):
             started = datetime.fromisoformat(check_in_at)
             worked = max(0, int((now-started).total_seconds()))
             earned = round((worked/3600)*5, 2)
-            await force_finish_attendance(session_id, interaction.guild.id, member.id, now.isoformat(), worked, earned, interaction.user.id)
-            await interaction.response.send_message(f"تم تسجيل خروج {member.mention} إجباريًا.\nالمدة: **{format_duration(worked)}**\nالنقاط: **{format_points(earned)}**", ephemeral=True)
-            await send_admin_log(interaction, "🔴 خروج إجباري", f"الموظف: {member.mention}\nالمدة: {format_duration(worked)}\nالنقاط: {format_points(earned)}")
+            forced_count, strike_level = await force_finish_attendance(session_id, interaction.guild.id, member.id, now.isoformat(), worked, earned, interaction.user.id)
+
+            # أول خروج إجباري لا يعطي Strike. من الخروج الإجباري الثاني يبدأ Strike 1.
+            STRIKE_ROLES = {
+                1: 1539288778210943069,
+                2: 1539289156059140309,
+                3: 1539289310321180853,
+            }
+            strike_role = None
+            if strike_level:
+                # إزالة أي Strike سابق ثم إعطاء المستوى الحالي.
+                for rid in STRIKE_ROLES.values():
+                    role = interaction.guild.get_role(rid)
+                    if role and role in member.roles:
+                        try:
+                            await member.remove_roles(role, reason="تحديث مستوى الاسترايك بعد خروج إجباري")
+                        except discord.HTTPException:
+                            pass
+                strike_role = interaction.guild.get_role(STRIKE_ROLES[strike_level])
+                if strike_role:
+                    try:
+                        await member.add_roles(strike_role, reason=f"Strike {strike_level} بسبب الخروج الإجباري رقم {forced_count}")
+                    except discord.HTTPException:
+                        strike_role = None
+
+            response = f"تم تسجيل خروج {member.mention} إجباريًا.\nالمدة: **{format_duration(worked)}**\nالنقاط: **{format_points(earned)}**"
+            if strike_level == 0:
+                response += "\nهذه أول مرة، لا يوجد Strike."
+            else:
+                response += f"\nتم تسجيل **Strike {strike_level}**."
+            await interaction.response.send_message(response, ephemeral=True)
+
+            strike_channel = interaction.guild.get_channel(1538208912329670787)
+            if strike_level and strike_channel:
+                embed = discord.Embed(title=f"Strike {strike_level}", timestamp=now)
+                embed.add_field(name="الموظف", value=member.mention, inline=False)
+                embed.add_field(name="الخروج الإجباري رقم", value=str(forced_count), inline=True)
+                embed.add_field(name="الإداري", value=interaction.user.mention, inline=True)
+                embed.add_field(name="الرتبة", value=strike_role.mention if strike_role else f"Strike {strike_level}", inline=False)
+                await strike_channel.send(embed=embed)
+
+            await send_admin_log(interaction, "🔴 خروج إجباري", f"الموظف: {member.mention}\nالمدة: {format_duration(worked)}\nالنقاط: {format_points(earned)}\nالخروج الإجباري رقم: {forced_count}\nStrike: {strike_level if strike_level else 'لا يوجد'}")
         elif self.action in ("add", "remove"):
             await interaction.response.send_modal(PointsModal(member.id, member.mention, self.action))
         elif self.action == "task":
@@ -328,12 +367,15 @@ class AdminButton(discord.ui.Button):
         if self.action == "all":
             rows = await get_all_employee_stats(interaction.guild.id)
             if not rows: return await interaction.response.send_message("لا توجد إحصائيات موظفين حتى الآن.", ephemeral=True)
+            embed = discord.Embed(title="📊 إحصائيات جميع الموظفين", description="ترتيب الموظفين حسب النقاط")
             lines = []
             for i, (uid, points, seconds, invoices, tasks) in enumerate(rows[:30], 1):
                 member = interaction.guild.get_member(uid)
                 name = member.mention if member else f"<@{uid}>"
-                lines.append(f"**#{i}** {name} — **{format_points(points)} نقطة** | {format_duration(seconds)} | {invoices} فاتورة | {tasks} مهمة")
-            return await interaction.response.send_message("**📊 ترتيب الموظفين حسب النقاط**\n" + "\n".join(lines), ephemeral=True)
+                lines.append(f"**#{i}** {name}\nالنقاط: **{format_points(points)}** | الساعات: **{format_duration(seconds)}** | الفواتير: **{invoices}** | المهام: **{tasks}**")
+            # Discord يسمح بحقل Description أطول من 2000 فقط عبر embed، مع حد 4096.
+            embed.description = "\n\n".join(lines[:30])[:4096]
+            return await interaction.response.send_message(embed=embed, ephemeral=True)
         if self.action == "reset_all":
             return await interaction.response.send_message("⚠️ هل أنت متأكد من تصفير نقاط **جميع الموظفين**؟", view=ConfirmResetAllView(), ephemeral=True)
 

@@ -16,6 +16,7 @@ CREATE TABLE IF NOT EXISTS employees (
     total_work_seconds INTEGER NOT NULL DEFAULT 0,
     total_invoices INTEGER NOT NULL DEFAULT 0,
     total_tasks INTEGER NOT NULL DEFAULT 0,
+    forced_checkout_count INTEGER NOT NULL DEFAULT 0,
     PRIMARY KEY (guild_id, user_id)
 );
 
@@ -70,84 +71,16 @@ CREATE TABLE IF NOT EXISTS employee_departures (
     departed_at TEXT NOT NULL,
     admin_id INTEGER
 );
-CREATE TABLE IF NOT EXISTS web_applications (
- id INTEGER PRIMARY KEY AUTOINCREMENT, guild_id INTEGER NOT NULL, discord_id INTEGER NOT NULL,
- reason TEXT NOT NULL, daily_hours TEXT NOT NULL, availability TEXT NOT NULL, previous_experience TEXT NOT NULL,
- difficult_customer TEXT NOT NULL, uniform_commitment TEXT NOT NULL, rules_agreement TEXT NOT NULL,
- status TEXT NOT NULL DEFAULT 'pending', browser_token TEXT NOT NULL UNIQUE, created_at TEXT NOT NULL, reviewed_at TEXT, reviewed_by INTEGER
-);
-CREATE INDEX IF NOT EXISTS idx_web_applications_user ON web_applications(guild_id,discord_id,id);
-
 """
 
 async def init_db():
-    """Initialize the database and safely repair legacy table schemas.
-
-    Older RestaurantBot versions used different attendance/invoice schemas.
-    CREATE TABLE IF NOT EXISTS does not upgrade an existing SQLite table, so
-    those old tables can make a new check-in fail *after* its image is posted.
-    Incompatible legacy tables are preserved under a legacy_* name.
-    """
     async with aiosqlite.connect(DB_PATH) as db:
-        async def table_info(table_name: str):
-            cur = await db.execute(f'PRAGMA table_info("{table_name}")')
-            return await cur.fetchall()
-
-        async def table_exists(table_name: str):
-            cur = await db.execute(
-                "SELECT 1 FROM sqlite_master WHERE type='table' AND name=?",
-                (table_name,)
-            )
-            return await cur.fetchone() is not None
-
-        async def backup_if_incompatible(table_name: str, required_columns: set[str], insert_columns: set[str]):
-            if not await table_exists(table_name):
-                return
-
-            info = await table_info(table_name)
-            columns = {row[1] for row in info}
-
-            # Missing columns required by the current code => legacy schema.
-            incompatible = not required_columns.issubset(columns)
-
-            # A legacy NOT NULL column with no default that current INSERTs do
-            # not provide would also make inserts fail.
-            for row in info:
-                _, name, _, notnull, default_value, pk = row
-                if name not in insert_columns and notnull and default_value is None and not pk:
-                    incompatible = True
-                    break
-
-            if incompatible:
-                suffix = 1
-                backup_name = f"legacy_{table_name}"
-                while await table_exists(backup_name):
-                    suffix += 1
-                    backup_name = f"legacy_{table_name}_{suffix}"
-                await db.execute(
-                    f'ALTER TABLE "{table_name}" RENAME TO "{backup_name}"'
-                )
-                print(f"⚠️ Migrated old table {table_name} -> {backup_name}")
-
-        await backup_if_incompatible(
-            "employees",
-            {"guild_id", "user_id", "points", "total_work_seconds", "total_invoices", "total_tasks"},
-            {"guild_id", "user_id", "points", "total_work_seconds", "total_invoices", "total_tasks"},
-        )
-        await backup_if_incompatible(
-            "attendance",
-            {"id", "guild_id", "user_id", "check_in_at", "check_in_image", "check_out_at",
-             "check_out_image", "worked_seconds", "points_earned", "forced_by"},
-            {"guild_id", "user_id", "check_in_at", "check_in_image", "check_out_at",
-             "check_out_image", "worked_seconds", "points_earned", "forced_by"},
-        )
-        await backup_if_incompatible(
-            "invoices",
-            {"id", "guild_id", "user_id", "created_at", "image_url", "points_earned"},
-            {"guild_id", "user_id", "created_at", "image_url", "points_earned"},
-        )
-
         await db.executescript(CREATE_TABLES)
+        # Migration آمنة للنسخ القديمة: لا تحذف أو تعيد إنشاء أي بيانات.
+        cur = await db.execute("PRAGMA table_info(employees)")
+        columns = {row[1] for row in await cur.fetchall()}
+        if "forced_checkout_count" not in columns:
+            await db.execute("ALTER TABLE employees ADD COLUMN forced_checkout_count INTEGER NOT NULL DEFAULT 0")
         await db.commit()
 
 async def set_setting(guild_id: int, key: str, value: str):
@@ -292,20 +225,26 @@ async def finish_attendance(session_id: int, guild_id: int, user_id: int, check_
 async def force_finish_attendance(session_id: int, guild_id: int, user_id: int, check_out_at: str, worked_seconds: int, points_earned: float, forced_by: int):
     async with aiosqlite.connect(DB_PATH) as db:
         await db.execute(
-            "UPDATE attendance SET check_out_at=?, worked_seconds=?, points_earned=?, forced_by=? "
-            "WHERE id=? AND check_out_at IS NULL",
+            "UPDATE attendance SET check_out_at=?, worked_seconds=?, points_earned=?, forced_by=? WHERE id=? AND check_out_at IS NULL",
             (check_out_at, worked_seconds, points_earned, forced_by, session_id),
         )
         await db.execute(
-            "UPDATE employees SET points = points + ?, total_work_seconds = total_work_seconds + ? "
-            "WHERE guild_id=? AND user_id=?",
+            "UPDATE employees SET points = points + ?, total_work_seconds = total_work_seconds + ?, forced_checkout_count = forced_checkout_count + 1 WHERE guild_id=? AND user_id=?",
             (points_earned, worked_seconds, guild_id, user_id),
         )
+        cur = await db.execute(
+            "SELECT forced_checkout_count FROM employees WHERE guild_id=? AND user_id=?",
+            (guild_id, user_id),
+        )
+        row = await cur.fetchone()
+        forced_count = int(row[0]) if row else 0
+        strike_level = max(0, min(3, forced_count - 1))
         await db.execute(
             "INSERT INTO point_transactions (guild_id, user_id, amount, reason, created_at, admin_id) VALUES (?, ?, ?, ?, ?, ?)",
             (guild_id, user_id, points_earned, "ساعات عمل - خروج إجباري", check_out_at, forced_by),
         )
         await db.commit()
+    return forced_count, strike_level
 
 async def add_invoice(guild_id: int, user_id: int, created_at: str, image_url: str):
     await ensure_employee(guild_id, user_id)
@@ -389,19 +328,3 @@ async def remove_employee_profile(guild_id: int, user_id: int, departure_type: s
         await db.execute("DELETE FROM employee_profiles WHERE guild_id=? AND user_id=?", (guild_id,user_id))
         await db.execute("INSERT INTO employee_departures (guild_id,user_id,departure_type,departed_at,admin_id) VALUES (?,?,?,?,?)", (guild_id,user_id,departure_type,departed_at,admin_id))
         await db.commit()
-
-async def create_web_application(guild_id,discord_id,a,token,created_at):
- async with aiosqlite.connect(DB_PATH) as db:
-  c=await db.execute("INSERT INTO web_applications (guild_id,discord_id,reason,daily_hours,availability,previous_experience,difficult_customer,uniform_commitment,rules_agreement,status,browser_token,created_at) VALUES (?,?,?,?,?,?,?,?,?,'pending',?,?)",(guild_id,discord_id,a['reason'],a['daily_hours'],a['availability'],a['previous_experience'],a['difficult_customer'],a['uniform_commitment'],a['rules_agreement'],token,created_at)); await db.commit(); return c.lastrowid
-async def get_web_application(i):
- async with aiosqlite.connect(DB_PATH) as db:
-  c=await db.execute("SELECT * FROM web_applications WHERE id=?",(i,)); return await c.fetchone()
-async def get_web_application_by_token(t):
- async with aiosqlite.connect(DB_PATH) as db:
-  c=await db.execute("SELECT * FROM web_applications WHERE browser_token=? ORDER BY id DESC LIMIT 1",(t,)); return await c.fetchone()
-async def get_latest_web_application_for_user(g,u):
- async with aiosqlite.connect(DB_PATH) as db:
-  c=await db.execute("SELECT * FROM web_applications WHERE guild_id=? AND discord_id=? ORDER BY id DESC LIMIT 1",(g,u)); return await c.fetchone()
-async def update_web_application_status(i,s,at,by):
- async with aiosqlite.connect(DB_PATH) as db:
-  await db.execute("UPDATE web_applications SET status=?,reviewed_at=?,reviewed_by=? WHERE id=?",(s,at,by,i)); await db.commit()
