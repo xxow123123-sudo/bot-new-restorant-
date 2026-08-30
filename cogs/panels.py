@@ -10,6 +10,7 @@ from database.db import (
     start_attendance, finish_attendance, force_finish_attendance, add_invoice,
     add_points, set_points, reset_all_points, add_task, get_all_employee_stats, get_employee_stats,
     save_employee_profile, get_employee_profile, search_employee_profiles, list_employee_profiles, remove_employee_profile,
+    add_disciplinary_action, get_manual_strike_level, get_attendance_strike_level,
 )
 
 def format_points(value: float) -> str:
@@ -262,6 +263,8 @@ class MemberPicker(discord.ui.UserSelect):
                 await strike_channel.send(embed=embed)
 
             await send_admin_log(interaction, "🔴 خروج إجباري", f"الموظف: {member.mention}\nالمدة: {format_duration(worked)}\nالنقاط: {format_points(earned)}\nالخروج الإجباري رقم: {forced_count}\nStrike: {strike_level if strike_level else 'لا يوجد'}")
+        elif self.action == "discipline":
+            await interaction.response.send_message("اختر مستوى الاسترايك:", view=DisciplineLevelView(member.id, member.mention), ephemeral=True)
         elif self.action in ("add", "remove"):
             await interaction.response.send_modal(PointsModal(member.id, member.mention, self.action))
         elif self.action == "task":
@@ -344,14 +347,105 @@ class PointsModal(discord.ui.Modal):
         await interaction.response.send_message(f"تم {verb} **{format_points(amount)}** نقطة لـ {self.mention}.\nنقاطه الآن: **{format_points(new_total)}**", ephemeral=True)
         await send_admin_log(interaction, f"⭐ {verb} نقاط", f"الموظف: {self.mention}\nالقيمة: {format_points(signed)}\nالسبب: {self.reason.value}\nالرصيد الجديد: {format_points(new_total)}")
 
+STRIKE_ROLES = {
+    1: 1539288778210943069,
+    2: 1539289156059140309,
+    3: 1539289310321180853,
+}
+
+class DisciplineReasonModal(discord.ui.Modal):
+    def __init__(self, user_id: int, mention: str, strike_level: int):
+        super().__init__(title=f"محاسبة - Strike {strike_level}")
+        self.user_id = user_id
+        self.mention = mention
+        self.strike_level = strike_level
+        self.reason = discord.ui.TextInput(
+            label="سبب المحاسبة",
+            placeholder="اكتب سبب الاسترايك",
+            style=discord.TextStyle.paragraph,
+            required=True,
+            max_length=800,
+        )
+        self.add_item(self.reason)
+
+    async def on_submit(self, interaction: discord.Interaction):
+        if not await admin_allowed(interaction):
+            return
+        member = interaction.guild.get_member(self.user_id)
+        if not member:
+            return await interaction.response.send_message("تعذر العثور على الموظف داخل السيرفر.", ephemeral=True)
+        channel = await get_log_channel(interaction, "discipline_log")
+        if not channel:
+            return await interaction.response.send_message("روم المحاسبات غير محدد. عيّنه من `/settings` أولًا.", ephemeral=True)
+
+        now = datetime.now(timezone.utc)
+        await add_disciplinary_action(
+            interaction.guild.id, member.id, self.strike_level, self.reason.value,
+            interaction.user.id, now.isoformat()
+        )
+
+        attendance_level = await get_attendance_strike_level(interaction.guild.id, member.id)
+        manual_level = await get_manual_strike_level(interaction.guild.id, member.id)
+        effective_level = max(attendance_level, manual_level)
+
+        for rid in STRIKE_ROLES.values():
+            role = interaction.guild.get_role(rid)
+            if role and role in member.roles:
+                try:
+                    await member.remove_roles(role, reason="تحديث رتبة الاسترايك بعد المحاسبة")
+                except discord.HTTPException:
+                    pass
+        strike_role = interaction.guild.get_role(STRIKE_ROLES.get(effective_level)) if effective_level else None
+        if strike_role:
+            try:
+                await member.add_roles(strike_role, reason=f"محاسبة إدارية - Strike {self.strike_level}")
+            except discord.HTTPException:
+                strike_role = None
+
+        embed = discord.Embed(title=f"⚠️ محاسبة | Strike {self.strike_level}", timestamp=now)
+        embed.add_field(name="الموظف", value=member.mention, inline=False)
+        embed.add_field(name="الاسترايك", value=f"Strike {self.strike_level}", inline=True)
+        embed.add_field(name="الإداري", value=interaction.user.mention, inline=True)
+        embed.add_field(name="السبب", value=self.reason.value, inline=False)
+        await channel.send(content=member.mention, embed=embed, allowed_mentions=discord.AllowedMentions(users=True, roles=False, everyone=False))
+
+        await interaction.response.send_message(
+            f"تمت محاسبة {member.mention} بـ **Strike {self.strike_level}** وإرسالها في {channel.mention}.",
+            ephemeral=True,
+        )
+        await send_admin_log(interaction, "⚠️ محاسبة موظف", f"الموظف: {member.mention}\
+Strike: {self.strike_level}\
+السبب: {self.reason.value}")
+
+class DisciplineLevelSelect(discord.ui.Select):
+    def __init__(self, user_id: int, mention: str):
+        self.user_id = user_id
+        self.mention = mention
+        super().__init__(
+            placeholder="اختر Strike 1 أو 2 أو 3",
+            min_values=1, max_values=1,
+            options=[
+                discord.SelectOption(label="Strike 1", value="1"),
+                discord.SelectOption(label="Strike 2", value="2"),
+                discord.SelectOption(label="Strike 3", value="3"),
+            ],
+        )
+    async def callback(self, interaction: discord.Interaction):
+        await interaction.response.send_modal(DisciplineReasonModal(self.user_id, self.mention, int(self.values[0])))
+
+class DisciplineLevelView(discord.ui.View):
+    def __init__(self, user_id: int, mention: str):
+        super().__init__(timeout=120)
+        self.add_item(DisciplineLevelSelect(user_id, mention))
+
 class AdminButton(discord.ui.Button):
     def __init__(self, label, custom_id, action, style=discord.ButtonStyle.secondary):
         self.action = action
         super().__init__(label=label, custom_id=custom_id, style=style)
     async def callback(self, interaction):
         if not await admin_allowed(interaction): return
-        if self.action in ("force","add","remove","task","stats","reset","fire"):
-            labels = {"force":"اختر الموظف لتسجيل خروجه إجباريًا:", "add":"اختر الموظف لزيادة نقاطه:", "remove":"اختر الموظف لخصم نقاطه:", "task":"اختر الموظف لاحتساب مهمة له:", "stats":"اختر الموظف لعرض إحصائياته:", "reset":"اختر الموظف لتصفير نقاطه:", "fire":"اختر الموظف الذي تريد فصله:"}
+        if self.action in ("force","add","remove","task","stats","reset","fire","discipline"):
+            labels = {"force":"اختر الموظف لتسجيل خروجه إجباريًا:", "add":"اختر الموظف لزيادة نقاطه:", "remove":"اختر الموظف لخصم نقاطه:", "task":"اختر الموظف لاحتساب مهمة له:", "stats":"اختر الموظف لعرض إحصائياته:", "reset":"اختر الموظف لتصفير نقاطه:", "fire":"اختر الموظف الذي تريد فصله:", "discipline":"اختر الموظف الذي تريد محاسبته:"}
             return await interaction.response.send_message(labels[self.action], view=MemberPickerView(self.action), ephemeral=True)
         if self.action == "active":
             rows = await get_all_active_attendance(interaction.guild.id)
@@ -611,6 +705,7 @@ class AdminPanel(discord.ui.View):
         self.add_item(AdminButton("تصفير الجميع","admin:reset_all","reset_all",discord.ButtonStyle.danger))
         self.add_item(AdminButton("تصفير موظف","admin:reset_one","reset",discord.ButtonStyle.danger))
         self.add_item(AdminButton("فصل موظف","admin:fire_employee","fire",discord.ButtonStyle.danger))
+        self.add_item(AdminButton("محاسبة موظف","admin:discipline","discipline",discord.ButtonStyle.danger))
         self.add_item(AdminDMButton())
         self.add_item(AdminEmployeeProfileButton())
 
@@ -1348,6 +1443,22 @@ class HRReviewView(discord.ui.View):
             ephemeral=True
         )
 
+        # نشر قرار التوظيف بصيغة بسيطة في روم القرارات بعد نجاح القبول وإعطاء الرتبة.
+        decisions_channel = await get_log_channel(interaction, "decisions_channel")
+        if decisions_channel:
+            decision_message = (
+                "بسم الله الرحمن الرحيم\n\n"
+                f"يتم تعيين العضو: {member.mention}\n\n"
+                f"برتبة: {role.mention}\n\n\n"
+                "يرجى من العضو **الرجوع للموقع** في حال الرغبة بمعرفة أي شيء يخص الرتبة أو النظام، "
+                "والحرص على **متابعة الرومات المهمة** أولًا بأول والاطلاع على جميع التحديثات والتنبيهات.\n\n"
+                f"اعتمدت بواسطة: {interaction.user.mention}"
+            )
+            await decisions_channel.send(
+                content=decision_message,
+                allowed_mentions=discord.AllowedMentions(users=True, roles=True, everyone=False)
+            )
+
         await send_admin_log(
             interaction,
             "👥 قبول الموارد البشرية",
@@ -1676,6 +1787,9 @@ class Panels(commands.Cog):
 
 🗑️ **تصفير موظف**
 تصفير نقاط موظف محدد فقط.
+
+⚠️ **محاسبة موظف**
+اختيار موظف ثم تحديد Strike 1 أو 2 أو 3 وكتابة السبب، وإرسال المحاسبة مع منشن الموظف في روم المحاسبات.
 
 🛑 **فصل موظف**
 اختيار موظف وكتابة رسالة الإدارة، ثم إزالة رتب الموظف والإجازة وحذف بياناته الوظيفية.

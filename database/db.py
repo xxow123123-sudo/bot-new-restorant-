@@ -52,6 +52,16 @@ CREATE TABLE IF NOT EXISTS point_transactions (
     admin_id INTEGER
 );
 
+CREATE TABLE IF NOT EXISTS disciplinary_actions (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    guild_id INTEGER NOT NULL,
+    user_id INTEGER NOT NULL,
+    strike_level INTEGER NOT NULL,
+    reason TEXT NOT NULL,
+    admin_id INTEGER NOT NULL,
+    created_at TEXT NOT NULL
+);
+
 CREATE TABLE IF NOT EXISTS employee_profiles (
     guild_id INTEGER NOT NULL,
     user_id INTEGER NOT NULL,
@@ -97,6 +107,14 @@ async def init_db():
         columns = {row[1] for row in await cur.fetchall()}
         if "forced_checkout_count" not in columns:
             await db.execute("ALTER TABLE employees ADD COLUMN forced_checkout_count INTEGER NOT NULL DEFAULT 0")
+
+        # ترقية آمنة لجدول طلبات الموقع بدون حذف أي طلبات قديمة.
+        cur = await db.execute("PRAGMA table_info(web_applications)")
+        app_columns = {row[1] for row in await cur.fetchall()}
+        if "reviewed_at" not in app_columns:
+            await db.execute("ALTER TABLE web_applications ADD COLUMN reviewed_at TEXT")
+        if "reviewed_by" not in app_columns:
+            await db.execute("ALTER TABLE web_applications ADD COLUMN reviewed_by INTEGER")
         await db.commit()
 
 
@@ -135,6 +153,40 @@ async def get_web_application_by_token(token: str):
             (token,),
         )
         return await cur.fetchone()
+
+
+async def get_web_application(app_id: int):
+    async with aiosqlite.connect(DB_PATH) as db:
+        cur = await db.execute(
+            "SELECT id,guild_id,user_id,reason,daily_hours,availability,"
+            "previous_experience,difficult_customer,uniform_commitment,"
+            "rules_agreement,status,token,created_at "
+            "FROM web_applications WHERE id=? LIMIT 1",
+            (app_id,),
+        )
+        return await cur.fetchone()
+
+
+async def get_latest_web_application_for_user(guild_id: int, user_id: int):
+    async with aiosqlite.connect(DB_PATH) as db:
+        cur = await db.execute(
+            "SELECT id,guild_id,user_id,reason,daily_hours,availability,"
+            "previous_experience,difficult_customer,uniform_commitment,"
+            "rules_agreement,status,token,created_at "
+            "FROM web_applications WHERE guild_id=? AND user_id=? "
+            "ORDER BY id DESC LIMIT 1",
+            (guild_id, user_id),
+        )
+        return await cur.fetchone()
+
+
+async def update_web_application_status(app_id: int, status: str, reviewed_at: str, reviewed_by: int):
+    async with aiosqlite.connect(DB_PATH) as db:
+        await db.execute(
+            "UPDATE web_applications SET status=?, reviewed_at=?, reviewed_by=? WHERE id=?",
+            (status, reviewed_at, reviewed_by, app_id),
+        )
+        await db.commit()
 
 
 async def set_setting(guild_id: int, key: str, value: str):
@@ -382,3 +434,32 @@ async def remove_employee_profile(guild_id: int, user_id: int, departure_type: s
         await db.execute("DELETE FROM employee_profiles WHERE guild_id=? AND user_id=?", (guild_id,user_id))
         await db.execute("INSERT INTO employee_departures (guild_id,user_id,departure_type,departed_at,admin_id) VALUES (?,?,?,?,?)", (guild_id,user_id,departure_type,departed_at,admin_id))
         await db.commit()
+
+async def add_disciplinary_action(guild_id: int, user_id: int, strike_level: int, reason: str, admin_id: int, created_at: str):
+    level = max(1, min(3, int(strike_level)))
+    async with aiosqlite.connect(DB_PATH) as db:
+        await db.execute(
+            "INSERT INTO disciplinary_actions (guild_id,user_id,strike_level,reason,admin_id,created_at) VALUES (?,?,?,?,?,?)",
+            (guild_id, user_id, level, reason, admin_id, created_at),
+        )
+        await db.commit()
+
+async def get_manual_strike_level(guild_id: int, user_id: int) -> int:
+    async with aiosqlite.connect(DB_PATH) as db:
+        cur = await db.execute(
+            "SELECT COALESCE(MAX(strike_level),0) FROM disciplinary_actions WHERE guild_id=? AND user_id=?",
+            (guild_id, user_id),
+        )
+        row = await cur.fetchone()
+        return int(row[0] or 0) if row else 0
+
+async def get_attendance_strike_level(guild_id: int, user_id: int) -> int:
+    await ensure_employee(guild_id, user_id)
+    async with aiosqlite.connect(DB_PATH) as db:
+        cur = await db.execute(
+            "SELECT forced_checkout_count FROM employees WHERE guild_id=? AND user_id=?",
+            (guild_id, user_id),
+        )
+        row = await cur.fetchone()
+        forced_count = int(row[0] or 0) if row else 0
+        return max(0, min(3, forced_count - 1))

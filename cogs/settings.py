@@ -28,7 +28,9 @@ CHANNEL_KEYS = {
     "application_ticket_category": "كاتقوري تذاكر المقبولين",
     "vacation_review": "طلبات الإجازات",
     "hr_review": "طلبات الموارد البشرية",
+    "decisions_channel": "روم القرارات",
     "admin_log": "اللوق الإداري",
+    "discipline_log": "روم المحاسبات والاسترايكات",
     "resignation_review": "طلبات الاستقالات",
     "employee_database_channel": "قاعدة بيانات الموظفين",
 }
