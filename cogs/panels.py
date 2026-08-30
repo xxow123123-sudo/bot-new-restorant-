@@ -70,10 +70,26 @@ async def request_image(interaction: discord.Interaction, prompt: str):
         await interaction.followup.send("انتهى الوقت. اضغط الزر وحاول مرة ثانية.", ephemeral=True)
         return None, None
 
+FIXED_CHANNELS = {
+    "attendance_log": 1538166452975046667,
+    "invoice_log": 1539032592580354174,
+    "discipline_log": 1538208912329670787,
+    "decisions_log": 1538208912329670787,
+    "application_log": 1539032752253313174,
+    "hr_log": 1538166804160184423,
+    "vacation_log": 1538166714632511640,
+    "resignation_log": 1539029748485718016,
+    "termination_log": 1539034314103324752,
+    "employee_database_log": 1539034291034521630,
+    "bot_log": 1539034314103324752,
+}
+
 async def get_log_channel(interaction: discord.Interaction, setting_key: str):
     if not interaction.guild:
         return None
     channel_id = await get_setting(interaction.guild.id, setting_key)
+    if not channel_id:
+        channel_id = FIXED_CHANNELS.get(setting_key)
     if not channel_id:
         return None
     channel = interaction.guild.get_channel(int(channel_id))
