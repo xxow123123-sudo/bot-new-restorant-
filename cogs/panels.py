@@ -402,12 +402,19 @@ class DisciplineReasonModal(discord.ui.Modal):
             except discord.HTTPException:
                 strike_role = None
 
-        embed = discord.Embed(title=f"⚠️ محاسبة | Strike {self.strike_level}", timestamp=now)
-        embed.add_field(name="الموظف", value=member.mention, inline=False)
-        embed.add_field(name="الاسترايك", value=f"Strike {self.strike_level}", inline=True)
-        embed.add_field(name="الإداري", value=interaction.user.mention, inline=True)
-        embed.add_field(name="السبب", value=self.reason.value, inline=False)
-        await channel.send(content=member.mention, embed=embed, allowed_mentions=discord.AllowedMentions(users=True, roles=False, everyone=False))
+        embed = discord.Embed(
+            title="بسم الله الرحمن الرحيم",
+            description=(
+                "**قرار إداري**\n\n"
+                f"يتم تحذير العضو: {member.mention}\n\n"
+                f"**نوع التحذير:** Strike {self.strike_level}\n\n"
+                f"**سبب التحذير:**\n{self.reason.value}\n\n"
+                "نأمل من العضو الانتباه والالتزام بالأنظمة والتعليمات، وعدم تكرار المخالفة مستقبلاً.\n\n"
+                f"اعتمدت بواسطة: {interaction.user.mention}"
+            ),
+            timestamp=now
+        )
+        await channel.send(content=member.mention + "\n||@here||", embed=embed, allowed_mentions=discord.AllowedMentions(users=True, roles=False, everyone=True))
 
         await interaction.response.send_message(
             f"تمت محاسبة {member.mention} بـ **Strike {self.strike_level}** وإرسالها في {channel.mention}.",
