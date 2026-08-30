@@ -445,6 +445,92 @@ class DisciplineLevelView(discord.ui.View):
         super().__init__(timeout=120)
         self.add_item(DisciplineLevelSelect(user_id, mention))
 
+
+
+class OpenMemberTicketModal(discord.ui.Modal):
+    def __init__(self):
+        super().__init__(title="فتح تكت مع عضو")
+        self.member_id = discord.ui.TextInput(
+            label="Discord ID للعضو",
+            placeholder="ضع Copy ID هنا",
+            required=True,
+            max_length=30
+        )
+        self.add_item(self.member_id)
+
+    async def on_submit(self, interaction: discord.Interaction):
+        if not await admin_allowed(interaction):
+            return
+
+        try:
+            member_id = int(self.member_id.value.strip())
+        except ValueError:
+            return await interaction.response.send_message("الـ ID غير صحيح.", ephemeral=True)
+
+        guild = interaction.guild
+        member = guild.get_member(member_id)
+        if member is None:
+            try:
+                member = await guild.fetch_member(member_id)
+            except discord.HTTPException:
+                member = None
+
+        if member is None:
+            return await interaction.response.send_message("لم يتم العثور على العضو.", ephemeral=True)
+
+        category_id = await get_setting(guild.id, "application_ticket_category")
+        category = guild.get_channel(int(category_id)) if category_id else None
+        if not isinstance(category, discord.CategoryChannel):
+            return await interaction.response.send_message(
+                "كاتقوري التكتات غير محدد. اضبطه من `/settings`.",
+                ephemeral=True
+            )
+
+        overwrites = {
+            guild.default_role: discord.PermissionOverwrite(view_channel=False),
+            member: discord.PermissionOverwrite(view_channel=True, send_messages=True),
+            interaction.user: discord.PermissionOverwrite(view_channel=True, send_messages=True),
+        }
+
+        ticket = await guild.create_text_channel(
+            name=f"اداري-{member.name}".replace(" ", "-")[:90],
+            category=category,
+            overwrites=overwrites,
+            reason=f"فتح تكت إداري بواسطة {interaction.user}"
+        )
+
+        embed = discord.Embed(
+            title="🎫 تكت إداري",
+            description=f"تم فتح تكت مع {member.mention}\n\nيرجى استخدام التكت للموضوع الإداري فقط.",
+            timestamp=datetime.now(timezone.utc)
+        )
+        await ticket.send(
+            content=member.mention,
+            embed=embed,
+            view=TicketControlView()
+        )
+
+        await interaction.response.send_message(
+            f"✅ تم فتح التكت: {ticket.mention}",
+            ephemeral=True
+        )
+
+
+class OpenMemberTicketButton(AdminButton if False else discord.ui.Button):
+    def __init__(self):
+        super().__init__(
+            label="فتح تكت مع عضو",
+            emoji="🎫",
+            style=discord.ButtonStyle.primary,
+            custom_id="admin:open_member_ticket"
+        )
+
+    async def callback(self, interaction: discord.Interaction):
+        if not await admin_allowed(interaction):
+            return
+        await interaction.response.send_modal(OpenMemberTicketModal())
+
+
 class AdminButton(discord.ui.Button):
     def __init__(self, label, custom_id, action, style=discord.ButtonStyle.secondary):
         self.action = action
@@ -713,6 +799,7 @@ class AdminPanel(discord.ui.View):
         self.add_item(AdminButton("تصفير موظف","admin:reset_one","reset",discord.ButtonStyle.danger))
         self.add_item(AdminButton("فصل موظف","admin:fire_employee","fire",discord.ButtonStyle.danger))
         self.add_item(AdminButton("محاسبة موظف","admin:discipline","discipline",discord.ButtonStyle.danger))
+        self.add_item(OpenMemberTicketButton())
         self.add_item(AdminDMButton())
         self.add_item(AdminEmployeeProfileButton())
 
