@@ -518,6 +518,14 @@ async def submit_task_evidence(task_id: int, guild_id: int, user_id: int, eviden
         await db.commit()
         return "submitted"
 
+async def get_pending_task_submissions(guild_id: int):
+    async with aiosqlite.connect(DB_PATH) as db:
+        cur = await db.execute(
+            "SELECT task_id,user_id FROM task_participants WHERE guild_id=? AND status='pending_review' AND evidence_url IS NOT NULL",
+            (guild_id,),
+        )
+        return await cur.fetchall()
+
 async def get_task_participant_evidence(task_id: int, guild_id: int, user_id: int):
     async with aiosqlite.connect(DB_PATH) as db:
         cur = await db.execute(
@@ -526,26 +534,59 @@ async def get_task_participant_evidence(task_id: int, guild_id: int, user_id: in
         )
         return await cur.fetchone()
 
-async def complete_task_for_user(task_id: int, guild_id: int, user_id: int, completed_by: int, completed_at: str):
+async def approve_task_submission(task_id: int, guild_id: int, user_id: int, admin_id: int, approved_at: str):
     async with aiosqlite.connect(DB_PATH) as db:
         await db.execute("BEGIN IMMEDIATE")
-        cur = await db.execute("SELECT status FROM task_participants WHERE task_id=? AND guild_id=? AND user_id=?", (task_id, guild_id, user_id))
+        cur = await db.execute(
+            "SELECT status,evidence_url FROM task_participants WHERE task_id=? AND guild_id=? AND user_id=?",
+            (task_id, guild_id, user_id),
+        )
         row = await cur.fetchone()
         if not row:
-            await db.rollback(); return "not_accepted"
+            await db.rollback(); return "not_found"
         if row[0] == "completed":
             await db.rollback(); return "already_completed"
+        if row[0] != "pending_review" or not row[1]:
+            await db.rollback(); return "not_submitted"
         await db.execute(
             "UPDATE task_participants SET status='completed',completed_at=?,completed_by=? WHERE task_id=? AND guild_id=? AND user_id=?",
-            (completed_at, completed_by, task_id, guild_id, user_id),
+            (approved_at, admin_id, task_id, guild_id, user_id),
         )
-        await db.execute("UPDATE employees SET points=points+7,total_tasks=total_tasks+1 WHERE guild_id=? AND user_id=?", (guild_id, user_id))
+        await db.execute(
+            "UPDATE employees SET points=points+7,total_tasks=total_tasks+1 WHERE guild_id=? AND user_id=?",
+            (guild_id, user_id),
+        )
         await db.execute(
             "INSERT INTO point_transactions (guild_id,user_id,amount,reason,created_at,admin_id) VALUES (?,?,?,?,?,?)",
-            (guild_id, user_id, 7, f"مهمة رقم {task_id}", completed_at, completed_by),
+            (guild_id, user_id, 7, f"احتساب مهمة رقم {task_id}", approved_at, admin_id),
         )
         await db.commit()
-        return "completed"
+        return "approved"
+
+async def reject_task_submission(task_id: int, guild_id: int, user_id: int, rejected_at: str):
+    async with aiosqlite.connect(DB_PATH) as db:
+        cur = await db.execute(
+            "SELECT status FROM task_participants WHERE task_id=? AND guild_id=? AND user_id=?",
+            (task_id, guild_id, user_id),
+        )
+        row = await cur.fetchone()
+        if not row:
+            return "not_found"
+        if row[0] == "completed":
+            return "already_completed"
+        if row[0] != "pending_review":
+            return "not_submitted"
+        # الرفض لا يلغي مقعد الموظف؛ يستطيع إعادة إرسال الدليل بعد التصحيح.
+        await db.execute(
+            "UPDATE task_participants SET status='accepted',evidence_url=NULL,evidence_at=NULL WHERE task_id=? AND guild_id=? AND user_id=?",
+            (task_id, guild_id, user_id),
+        )
+        await db.commit()
+        return "rejected"
+
+async def complete_task_for_user(task_id: int, guild_id: int, user_id: int, completed_by: int, completed_at: str):
+    # متوافق مع الاستدعاءات القديمة: الإكمال الإداري القديم أصبح اعتمادًا نهائيًا.
+    return await approve_task_submission(task_id, guild_id, user_id, completed_by, completed_at)
 
 async def close_task(task_id: int, guild_id: int):
     async with aiosqlite.connect(DB_PATH) as db:

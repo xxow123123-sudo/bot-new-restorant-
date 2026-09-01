@@ -11,7 +11,7 @@ from database.db import (
     start_attendance, finish_attendance, force_finish_attendance, add_invoice,
     add_points, set_points, reset_all_points, add_task, get_all_employee_stats, get_employee_stats,
     create_task, set_task_message, get_task, get_active_tasks, get_task_participant_count,
-    get_task_participants, accept_task, submit_task_evidence, get_task_participant_evidence, complete_task_for_user, close_task,
+    get_task_participants, accept_task, submit_task_evidence, get_task_participant_evidence, get_pending_task_submissions, complete_task_for_user, approve_task_submission, reject_task_submission, close_task,
     save_employee_profile, get_employee_profile, search_employee_profiles, list_employee_profiles, remove_employee_profile,
     add_disciplinary_action, get_manual_strike_level, get_attendance_strike_level,
 )
@@ -330,9 +330,14 @@ class TaskPublishModal(discord.ui.Modal):
         except ValueError:
             return await interaction.response.send_message("اكتب عددًا صحيحًا من 1 إلى 99.", ephemeral=True)
 
-        await interaction.response.send_message("أرسل **صورة المهمة** الآن في نفس الروم خلال دقيقتين.", ephemeral=True)
+        task_channel_id = await get_setting(interaction.guild.id, "task_channel")
+        task_channel = interaction.guild.get_channel(int(task_channel_id)) if task_channel_id else None
+        if not isinstance(task_channel, discord.TextChannel):
+            return await interaction.response.send_message("روم نشر المهام غير محدد. خلي الإدارة تضبطه من `/settings`.", ephemeral=True)
+
+        await interaction.response.send_message(f"أرسل **صورة المهمة** الآن في {task_channel.mention} أو في نفس روم لوحة الإدارة خلال دقيقتين.", ephemeral=True)
         def check(message):
-            if message.author.id != interaction.user.id or message.channel.id != interaction.channel_id or not message.attachments:
+            if message.author.id != interaction.user.id or message.channel.id not in (interaction.channel_id, task_channel.id) or not message.attachments:
                 return False
             a = message.attachments[0]
             ctype = a.content_type or ""
@@ -344,20 +349,20 @@ class TaskPublishModal(discord.ui.Modal):
 
         attachment = source.attachments[0]
         task_id = await create_task(
-            interaction.guild.id, interaction.channel_id, self.title_input.value.strip(),
+            interaction.guild.id, task_channel.id, self.title_input.value.strip(),
             self.description_input.value.strip(), attachment.url, maximum,
             interaction.user.id, datetime.now(timezone.utc).isoformat()
         )
         embed = discord.Embed(title=f"📋 | مهمة جديدة — {self.title_input.value.strip()}", description=self.description_input.value.strip())
         embed.add_field(name="👥 المقاعد", value=f"0 / {maximum}", inline=True)
         embed.add_field(name="الحالة", value="🟢 مفتوحة", inline=True)
-        embed.add_field(name="النقاط عند الإنجاز", value="+7 نقاط", inline=True)
+        embed.add_field(name="الإنجاز", value="اضغط إكمال المهمة وأرسل صورة، ثم تعتمدها الإدارة", inline=False)
         embed.set_footer(text=f"رقم المهمة: {task_id}")
         image_bytes = await attachment.read()
         filename = attachment.filename or "task.png"
         embed.set_image(url=f"attachment://{filename}")
         task_file = discord.File(BytesIO(image_bytes), filename=filename)
-        msg = await self.channel.send(embed=embed, file=task_file, view=TaskView(task_id, maximum, 0, "open"))
+        msg = await task_channel.send(embed=embed, file=task_file, view=TaskView(task_id, maximum, 0, "open"))
         stored_image_url = msg.attachments[0].url if msg.attachments else attachment.url
         await set_task_message(task_id, msg.id, stored_image_url)
         try: await source.delete()
@@ -390,7 +395,7 @@ class TaskAcceptButton(discord.ui.Button):
 
 class TaskEvidenceButton(discord.ui.Button):
     def __init__(self, task_id):
-        super().__init__(label="إرسال الدليل", emoji="📸", style=discord.ButtonStyle.primary, custom_id=f"task:evidence:{task_id}")
+        super().__init__(label="إكمال المهمة", emoji="🏁", style=discord.ButtonStyle.primary, custom_id=f"task:evidence:{task_id}")
         self.task_id = task_id
 
     async def callback(self, interaction):
@@ -400,56 +405,50 @@ class TaskEvidenceButton(discord.ui.Button):
             return await interaction.response.send_message("هذه المهمة غير موجودة.", ephemeral=True)
         participant = await get_task_participant_evidence(self.task_id, interaction.guild.id, interaction.user.id)
         if not participant:
-            return await interaction.response.send_message("لازم تقبل المهمة أولًا قبل إرسال الدليل.", ephemeral=True)
+            return await interaction.response.send_message("لازم تقبل المهمة أولًا.", ephemeral=True)
         if participant[2] == "completed":
-            return await interaction.response.send_message("تم إكمال هذه المهمة مسبقًا.", ephemeral=True)
+            return await interaction.response.send_message("تم احتساب هذه المهمة لك مسبقًا.", ephemeral=True)
+        if participant[2] == "pending_review":
+            return await interaction.response.send_message("دليلك السابق بانتظار مراجعة الإدارة.", ephemeral=True)
 
-        await interaction.response.send_message(
-            "📸 أرسل الآن **صورة الدليل** التي توضح الأشياء التي صنعتها في المهمة، في نفس الروم خلال دقيقتين.",
-            ephemeral=True
-        )
-
+        await interaction.response.send_message("📸 أرسل صورة الأشياء التي صنعتها في المهمة في نفس الشات خلال دقيقتين.", ephemeral=True)
         def check(message):
             if message.author.id != interaction.user.id or message.channel.id != interaction.channel_id or not message.attachments:
                 return False
             a = message.attachments[0]
             ctype = a.content_type or ""
             return ctype.startswith("image/") or a.filename.lower().endswith((".png", ".jpg", ".jpeg", ".webp", ".gif"))
-
         try:
             source = await interaction.client.wait_for("message", timeout=120, check=check)
         except asyncio.TimeoutError:
-            return await interaction.followup.send("انتهى الوقت. اضغط **إرسال الدليل** وحاول مرة ثانية.", ephemeral=True)
+            return await interaction.followup.send("انتهى الوقت. اضغط **إكمال المهمة** وحاول مرة ثانية.", ephemeral=True)
 
         attachment = source.attachments[0]
         try:
             image_bytes = await attachment.read()
-            filename = attachment.filename or "evidence.png"
-            log_channel = await get_log_channel(interaction, "admin_log")
+            filename = attachment.filename or "task_evidence.png"
+            log_channel = await get_log_channel(interaction, "task_log")
+            if not log_channel:
+                return await interaction.followup.send("لوق المهام غير محدد. خلي الإدارة تضبطه من `/settings`.", ephemeral=True)
             evidence_url = attachment.url
-            if log_channel:
-                evidence_embed = discord.Embed(
-                    title="📸 دليل مهمة",
-                    description=f"**المهمة:** {task[4]}\n**رقم المهمة:** {self.task_id}\n**الموظف:** {interaction.user.mention}",
-                    timestamp=datetime.now(timezone.utc)
-                )
-                evidence_file = discord.File(BytesIO(image_bytes), filename=filename)
-                evidence_embed.set_image(url=f"attachment://{filename}")
-                evidence_msg = await log_channel.send(embed=evidence_embed, file=evidence_file)
-                if evidence_msg.attachments:
-                    evidence_url = evidence_msg.attachments[0].url
-                await send_admin_log(interaction, "📸 تم إرسال دليل مهمة", f"الموظف: {interaction.user.mention}\nالمهمة: **{task[4]}**\nرقم المهمة: **{self.task_id}**")
-
-            result = await submit_task_evidence(
-                self.task_id, interaction.guild.id, interaction.user.id, evidence_url,
-                datetime.now(timezone.utc).isoformat()
+            review_embed = discord.Embed(
+                title="📋 | مراجعة إنجاز مهمة",
+                description=f"**المهمة:** {task[4]}\n**رقم المهمة:** {self.task_id}\n**الموظف:** {interaction.user.mention}\n\n**الحالة:** ⏳ بانتظار مراجعة الإدارة",
+                timestamp=datetime.now(timezone.utc)
             )
+            review_embed.add_field(name="المطلوب", value="راجع الصورة ثم اختر قبول أو رفض.", inline=False)
+            review_file = discord.File(BytesIO(image_bytes), filename=filename)
+            review_embed.set_image(url=f"attachment://{filename}")
+            review_msg = await log_channel.send(embed=review_embed, file=review_file, view=TaskReviewView(self.task_id, interaction.user.id))
+            if review_msg.attachments:
+                evidence_url = review_msg.attachments[0].url
+            result = await submit_task_evidence(self.task_id, interaction.guild.id, interaction.user.id, evidence_url, datetime.now(timezone.utc).isoformat())
             if result == "submitted":
                 try: await source.delete()
                 except (discord.Forbidden, discord.NotFound, discord.HTTPException): pass
-                await interaction.followup.send("✅ تم إرسال الدليل بنجاح، وتم رفعه للإدارة للمراجعة.", ephemeral=True)
+                await interaction.followup.send("✅ تم إرسال الإنجاز، وبانتظار اعتماد الإدارة من لوق المهام.", ephemeral=True)
             elif result == "completed":
-                await interaction.followup.send("تم إكمال المهمة مسبقًا.", ephemeral=True)
+                await interaction.followup.send("تم احتساب المهمة مسبقًا.", ephemeral=True)
             else:
                 await interaction.followup.send("لازم تقبل المهمة أولًا.", ephemeral=True)
         except Exception:
@@ -478,13 +477,50 @@ class TaskCloseButton(discord.ui.Button):
         except discord.HTTPException: pass
         await interaction.response.send_message("تم إغلاق المهمة ولن يستطيع أحد قبولها.", ephemeral=True)
 
+class TaskReviewView(discord.ui.View):
+    def __init__(self, task_id, user_id, disabled=False):
+        super().__init__(timeout=None)
+        self.add_item(TaskApproveButton(task_id, user_id, disabled))
+        self.add_item(TaskRejectButton(task_id, user_id, disabled))
+
+class TaskApproveButton(discord.ui.Button):
+    def __init__(self, task_id, user_id, disabled=False):
+        super().__init__(label="قبول واحتساب +7", emoji="✅", style=discord.ButtonStyle.success, custom_id=f"task:approve:{task_id}:{user_id}", disabled=disabled)
+        self.task_id, self.user_id = task_id, user_id
+    async def callback(self, interaction):
+        if not await admin_allowed(interaction): return
+        result = await approve_task_submission(self.task_id, interaction.guild.id, self.user_id, interaction.user.id, datetime.now(timezone.utc).isoformat())
+        if result == "approved":
+            points = await get_points(interaction.guild.id, self.user_id)
+            member = interaction.guild.get_member(self.user_id)
+            name = member.mention if member else f"<@{self.user_id}>"
+            await interaction.response.edit_message(content=f"✅ تم اعتماد المهمة لـ {name} وإضافة **7 نقاط**.\nالرصيد الآن: **{format_points(points)} نقطة**", view=TaskReviewView(self.task_id, self.user_id, True))
+            await send_admin_log(interaction, "✅ اعتماد مهمة", f"الموظف: <@{self.user_id}>\nرقم المهمة: {self.task_id}\nالنقاط: +7")
+        elif result == "already_completed":
+            await interaction.response.send_message("هذه المهمة محتسبة مسبقًا.", ephemeral=True)
+        else:
+            await interaction.response.send_message("لا يوجد إنجاز بانتظار المراجعة لهذا الموظف.", ephemeral=True)
+
+class TaskRejectButton(discord.ui.Button):
+    def __init__(self, task_id, user_id, disabled=False):
+        super().__init__(label="رفض", emoji="❌", style=discord.ButtonStyle.danger, custom_id=f"task:reject:{task_id}:{user_id}", disabled=disabled)
+        self.task_id, self.user_id = task_id, user_id
+    async def callback(self, interaction):
+        if not await admin_allowed(interaction): return
+        result = await reject_task_submission(self.task_id, interaction.guild.id, self.user_id, datetime.now(timezone.utc).isoformat())
+        if result == "rejected":
+            member = interaction.guild.get_member(self.user_id)
+            name = member.mention if member else f"<@{self.user_id}>"
+            await interaction.response.edit_message(content=f"❌ تم رفض إنجاز المهمة لـ {name}. يمكن للموظف إعادة إرسال الدليل.", view=TaskReviewView(self.task_id, self.user_id, True))
+            await send_admin_log(interaction, "❌ رفض إنجاز مهمة", f"الموظف: <@{self.user_id}>\nرقم المهمة: {self.task_id}")
+        else:
+            await interaction.response.send_message("لا يوجد إنجاز بانتظار المراجعة.", ephemeral=True)
+
 class TaskView(discord.ui.View):
     def __init__(self, task_id, maximum=1, count=0, status="open"):
         super().__init__(timeout=None)
         self.add_item(TaskAcceptButton(task_id, disabled=(status != "open" or count >= maximum)))
         self.add_item(TaskEvidenceButton(task_id))
-        self.add_item(TaskCompleteButton(task_id))
-        self.add_item(TaskCloseButton(task_id))
 
 class TaskParticipantSelect(discord.ui.UserSelect):
     def __init__(self, task_id):
@@ -518,7 +554,7 @@ async def build_task_embed(task_id):
     embed = discord.Embed(title=f"📋 | مهمة — {task[4]}", description=task[5])
     embed.add_field(name="👥 المقاعد", value=f"{count} / {task[7]}", inline=True)
     embed.add_field(name="الحالة", value=status_text, inline=True)
-    embed.add_field(name="النقاط عند الإنجاز", value="+7 نقاط", inline=True)
+    embed.add_field(name="الإنجاز", value="اضغط إكمال المهمة وأرسل صورة، ثم تعتمدها الإدارة", inline=False)
     embed.set_footer(text=f"رقم المهمة: {task_id}")
     embed.set_image(url=task[6])
     return embed
@@ -2132,13 +2168,18 @@ class Panels(commands.Cog):
         if not guild_id:
             return
         tasks = await get_active_tasks(guild_id)
-        # المهام المفتوحة فقط تحتاج إعادة تسجيل؛ المهام المكتملة العدد يتم تحديثها عند أول تفاعل/إعادة إرسال.
+        # المهام المفتوحة/المكتملة العدد تحتاج إعادة تسجيل أزرارها بعد إعادة تشغيل البوت.
         for task in tasks:
             if task[3]:
                 try:
                     self.bot.add_view(TaskView(task[0], task[7], await get_task_participant_count(task[0]), task[8]), message_id=task[3])
                 except Exception as exc:
                     print(f"⚠️ تعذر إعادة تسجيل View للمهمة {task[0]}: {exc}")
+        for task_id, user_id in await get_pending_task_submissions(guild_id):
+            try:
+                self.bot.add_view(TaskReviewView(task_id, user_id), message_id=None)
+            except Exception as exc:
+                print(f"⚠️ تعذر إعادة تسجيل مراجعة المهمة {task_id}/{user_id}: {exc}")
 
     @app_commands.command(name="لوحة-الادارة",description="إرسال لوحة تحكم الإدارة")
     async def admin_panel(self,interaction):
