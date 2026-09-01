@@ -82,6 +82,34 @@ CREATE TABLE IF NOT EXISTS employee_departures (
     admin_id INTEGER
 );
 
+
+
+CREATE TABLE IF NOT EXISTS tasks (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    guild_id INTEGER NOT NULL,
+    channel_id INTEGER NOT NULL,
+    message_id INTEGER,
+    title TEXT NOT NULL,
+    description TEXT NOT NULL,
+    image_url TEXT NOT NULL,
+    max_participants INTEGER NOT NULL,
+    status TEXT NOT NULL DEFAULT 'open',
+    created_by INTEGER NOT NULL,
+    created_at TEXT NOT NULL
+);
+
+CREATE TABLE IF NOT EXISTS task_participants (
+    task_id INTEGER NOT NULL,
+    guild_id INTEGER NOT NULL,
+    user_id INTEGER NOT NULL,
+    status TEXT NOT NULL DEFAULT 'accepted',
+    accepted_at TEXT NOT NULL,
+    completed_at TEXT,
+    completed_by INTEGER,
+    PRIMARY KEY (task_id, user_id),
+    FOREIGN KEY (task_id) REFERENCES tasks(id)
+);
+
 CREATE TABLE IF NOT EXISTS web_applications (
     id INTEGER PRIMARY KEY AUTOINCREMENT,
     guild_id INTEGER NOT NULL,
@@ -107,6 +135,14 @@ async def init_db():
         columns = {row[1] for row in await cur.fetchall()}
         if "forced_checkout_count" not in columns:
             await db.execute("ALTER TABLE employees ADD COLUMN forced_checkout_count INTEGER NOT NULL DEFAULT 0")
+
+        # ترقية آمنة لنظام أدلة المهام بدون حذف أو تعديل البيانات القديمة.
+        cur = await db.execute("PRAGMA table_info(task_participants)")
+        task_columns = {row[1] for row in await cur.fetchall()}
+        if "evidence_url" not in task_columns:
+            await db.execute("ALTER TABLE task_participants ADD COLUMN evidence_url TEXT")
+        if "evidence_at" not in task_columns:
+            await db.execute("ALTER TABLE task_participants ADD COLUMN evidence_at TEXT")
 
         # ترقية آمنة لجدول طلبات الموقع بدون حذف أي طلبات قديمة.
         cur = await db.execute("PRAGMA table_info(web_applications)")
@@ -380,6 +416,140 @@ async def add_task(guild_id: int, user_id: int, created_at: str, admin_id=None, 
             "INSERT INTO point_transactions (guild_id, user_id, amount, reason, created_at, admin_id) VALUES (?, ?, 7, ?, ?, ?)",
             (guild_id, user_id, f"مهمة: {reason}", created_at, admin_id),
         )
+        await db.commit()
+
+async def create_task(guild_id: int, channel_id: int, title: str, description: str, image_url: str, max_participants: int, created_by: int, created_at: str):
+    async with aiosqlite.connect(DB_PATH) as db:
+        cur = await db.execute(
+            "INSERT INTO tasks (guild_id,channel_id,title,description,image_url,max_participants,created_by,created_at) VALUES (?,?,?,?,?,?,?,?)",
+            (guild_id, channel_id, title, description, image_url, max_participants, created_by, created_at),
+        )
+        task_id = cur.lastrowid
+        await db.commit()
+        return int(task_id)
+
+async def set_task_message(task_id: int, message_id: int, image_url: str | None = None):
+    async with aiosqlite.connect(DB_PATH) as db:
+        if image_url:
+            await db.execute("UPDATE tasks SET message_id=?, image_url=? WHERE id=?", (message_id, image_url, task_id))
+        else:
+            await db.execute("UPDATE tasks SET message_id=? WHERE id=?", (message_id, task_id))
+        await db.commit()
+
+async def get_task(task_id: int):
+    async with aiosqlite.connect(DB_PATH) as db:
+        cur = await db.execute(
+            "SELECT id,guild_id,channel_id,message_id,title,description,image_url,max_participants,status,created_by,created_at FROM tasks WHERE id=?",
+            (task_id,),
+        )
+        return await cur.fetchone()
+
+async def get_active_tasks(guild_id: int):
+    async with aiosqlite.connect(DB_PATH) as db:
+        cur = await db.execute(
+            "SELECT id,guild_id,channel_id,message_id,title,description,image_url,max_participants,status,created_by,created_at FROM tasks WHERE guild_id=? AND status IN ('open','full') ORDER BY id DESC",
+            (guild_id,),
+        )
+        return await cur.fetchall()
+
+async def get_task_participant_count(task_id: int):
+    async with aiosqlite.connect(DB_PATH) as db:
+        cur = await db.execute("SELECT COUNT(*) FROM task_participants WHERE task_id=?", (task_id,))
+        row = await cur.fetchone()
+        return int(row[0] or 0)
+
+async def get_task_participants(task_id: int):
+    async with aiosqlite.connect(DB_PATH) as db:
+        cur = await db.execute(
+            "SELECT user_id,status,accepted_at,completed_at FROM task_participants WHERE task_id=? ORDER BY accepted_at ASC",
+            (task_id,),
+        )
+        return await cur.fetchall()
+
+async def accept_task(task_id: int, guild_id: int, user_id: int, accepted_at: str):
+    # حجز المقعد بشكل ذري حتى لا يتجاوز العدد المحدد لو ضغط أكثر من شخص بنفس اللحظة.
+    async with aiosqlite.connect(DB_PATH) as db:
+        await db.execute("BEGIN IMMEDIATE")
+        cur = await db.execute("SELECT max_participants,status FROM tasks WHERE id=? AND guild_id=?", (task_id, guild_id))
+        task = await cur.fetchone()
+        if not task:
+            await db.rollback(); return "not_found", 0, 0
+        maximum, status = int(task[0]), task[1]
+        if status != "open":
+            await db.rollback(); return "closed", await _count_in_tx(db, task_id), maximum
+        cur = await db.execute("SELECT 1 FROM task_participants WHERE task_id=? AND user_id=?", (task_id, user_id))
+        if await cur.fetchone():
+            count = await _count_in_tx(db, task_id)
+            await db.rollback(); return "already", count, maximum
+        count = await _count_in_tx(db, task_id)
+        if count >= maximum:
+            await db.execute("UPDATE tasks SET status='full' WHERE id=?", (task_id,))
+            await db.commit(); return "full", count, maximum
+        await db.execute(
+            "INSERT INTO task_participants (task_id,guild_id,user_id,status,accepted_at) VALUES (?,?,?,?,?)",
+            (task_id, guild_id, user_id, "accepted", accepted_at),
+        )
+        count += 1
+        if count >= maximum:
+            await db.execute("UPDATE tasks SET status='full' WHERE id=?", (task_id,))
+        await db.commit()
+        return "accepted", count, maximum
+
+async def _count_in_tx(db, task_id: int):
+    cur = await db.execute("SELECT COUNT(*) FROM task_participants WHERE task_id=?", (task_id,))
+    row = await cur.fetchone()
+    return int(row[0] or 0)
+
+async def submit_task_evidence(task_id: int, guild_id: int, user_id: int, evidence_url: str, evidence_at: str):
+    async with aiosqlite.connect(DB_PATH) as db:
+        cur = await db.execute(
+            "SELECT status FROM task_participants WHERE task_id=? AND guild_id=? AND user_id=?",
+            (task_id, guild_id, user_id),
+        )
+        row = await cur.fetchone()
+        if not row:
+            return "not_accepted"
+        if row[0] == "completed":
+            return "completed"
+        await db.execute(
+            "UPDATE task_participants SET evidence_url=?, evidence_at=? WHERE task_id=? AND guild_id=? AND user_id=?",
+            (evidence_url, evidence_at, task_id, guild_id, user_id),
+        )
+        await db.commit()
+        return "submitted"
+
+async def get_task_participant_evidence(task_id: int, guild_id: int, user_id: int):
+    async with aiosqlite.connect(DB_PATH) as db:
+        cur = await db.execute(
+            "SELECT evidence_url,evidence_at,status FROM task_participants WHERE task_id=? AND guild_id=? AND user_id=?",
+            (task_id, guild_id, user_id),
+        )
+        return await cur.fetchone()
+
+async def complete_task_for_user(task_id: int, guild_id: int, user_id: int, completed_by: int, completed_at: str):
+    async with aiosqlite.connect(DB_PATH) as db:
+        await db.execute("BEGIN IMMEDIATE")
+        cur = await db.execute("SELECT status FROM task_participants WHERE task_id=? AND guild_id=? AND user_id=?", (task_id, guild_id, user_id))
+        row = await cur.fetchone()
+        if not row:
+            await db.rollback(); return "not_accepted"
+        if row[0] == "completed":
+            await db.rollback(); return "already_completed"
+        await db.execute(
+            "UPDATE task_participants SET status='completed',completed_at=?,completed_by=? WHERE task_id=? AND guild_id=? AND user_id=?",
+            (completed_at, completed_by, task_id, guild_id, user_id),
+        )
+        await db.execute("UPDATE employees SET points=points+7,total_tasks=total_tasks+1 WHERE guild_id=? AND user_id=?", (guild_id, user_id))
+        await db.execute(
+            "INSERT INTO point_transactions (guild_id,user_id,amount,reason,created_at,admin_id) VALUES (?,?,?,?,?,?)",
+            (guild_id, user_id, 7, f"مهمة رقم {task_id}", completed_at, completed_by),
+        )
+        await db.commit()
+        return "completed"
+
+async def close_task(task_id: int, guild_id: int):
+    async with aiosqlite.connect(DB_PATH) as db:
+        await db.execute("UPDATE tasks SET status='closed' WHERE id=? AND guild_id=?", (task_id, guild_id))
         await db.commit()
 
 async def get_all_employee_stats(guild_id: int):
