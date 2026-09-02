@@ -353,11 +353,8 @@ class TaskPublishModal(discord.ui.Modal):
             self.description_input.value.strip(), attachment.url, maximum,
             interaction.user.id, datetime.now(timezone.utc).isoformat()
         )
-        embed = discord.Embed(title=f"📋 | مهمة جديدة — {self.title_input.value.strip()}", description=self.description_input.value.strip())
-        embed.add_field(name="👥 المقاعد", value=f"0 / {maximum}", inline=True)
-        embed.add_field(name="الحالة", value="🟢 مفتوحة", inline=True)
-        embed.add_field(name="الإنجاز", value="اضغط إكمال المهمة وأرسل صورة، ثم تعتمدها الإدارة", inline=False)
-        embed.set_footer(text=f"رقم المهمة: {task_id}")
+        embed = await build_task_embed(task_id)
+        embed.title = f"📋 | مهمة جديدة — {self.title_input.value.strip()}"
         image_bytes = await attachment.read()
         filename = attachment.filename or "task.png"
         embed.set_image(url=f"attachment://{filename}")
@@ -547,12 +544,26 @@ class TaskParticipantView(discord.ui.View):
 
 async def build_task_embed(task_id):
     task = await get_task(task_id)
-    if not task: return discord.Embed(title="مهمة غير موجودة")
-    count = await get_task_participant_count(task_id)
+    if not task:
+        return discord.Embed(title="مهمة غير موجودة")
+
+    participants = await get_task_participants(task_id)
+    maximum = int(task[7])
+    count = len(participants)
     status = task[8]
-    status_text = "🟢 مفتوحة" if status == "open" and count < task[7] else ("🟠 مكتملة العدد" if status == "full" or count >= task[7] else "🔒 مغلقة")
+    status_text = "🟢 مفتوحة" if status == "open" and count < maximum else ("🟠 مكتملة العدد" if status == "full" or count >= maximum else "🔒 مغلقة")
+
+    # كل مقعد يبقى ثابتًا: المقبول يظهر منشنه، والمقاعد المتبقية تبقى شاغرة.
+    seats = []
+    for index in range(maximum):
+        if index < count:
+            user_id = participants[index][0]
+            seats.append(f"**المقعد {index + 1}:** <@{user_id}>")
+        else:
+            seats.append(f"**المقعد {index + 1}:** شاغر")
+
     embed = discord.Embed(title=f"📋 | مهمة — {task[4]}", description=task[5])
-    embed.add_field(name="👥 المقاعد", value=f"{count} / {task[7]}", inline=True)
+    embed.add_field(name="👥 المقاعد", value="\n".join(seats), inline=False)
     embed.add_field(name="الحالة", value=status_text, inline=True)
     embed.add_field(name="الإنجاز", value="اضغط إكمال المهمة وأرسل صورة، ثم تعتمدها الإدارة", inline=False)
     embed.set_footer(text=f"رقم المهمة: {task_id}")
