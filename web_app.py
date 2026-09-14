@@ -4,7 +4,7 @@ from datetime import datetime,timezone
 from aiohttp import web
 import discord
 from config import GUILD_ID,DISCORD_INVITE_URL
-from database.db import create_web_application,get_web_application_by_token,get_setting
+from database.db import create_web_application,get_web_application_by_token,get_setting,can_user_apply
 from cogs.web_applications import WebApplicationReviewView
 A=Path(__file__).parent/"web_assets"
 RULES=[("الالتزام بالزي الرسمي","يجب الالتزام بالزي الرسمي المعتمد للمطعم طوال فترة العمل."),("منع الأعمال الإجرامية بالزي الرسمي","يُمنع القيام بأي عمل إجرامي أثناء ارتداء الزي الرسمي، ومخالفة ذلك يترتب عليها الفصل."),("احترام الزبائن وحسن التعامل","يُمنع التعامل بقلة أدب أو حدة مع أي زبون."),("التعامل مع المشاكل","عند حدوث مشكلة ارجع للمشرف وتجنب الجدال."),("تمثيل المطعم","أسلوبك يعكس صورتك وصورة Bean Machine."),("الوجبات المجانية","لكل موظف 10 وجبات مجانية فقط."),("منع البيع المجاني","يُمنع البيع المجاني خارج الصلاحيات المسموحة."),("الأسعار الرسمية","يجب الالتزام بالأسعار المعتمدة دون زيادة أو نقصان."),("المطعم منطقة آمنة","يُمنع التهديد أو القتل أو الأعمال العدائية داخل المطعم."),("التعامل مع المخالفات","ارفع المخالفة للإدارة ولا ترد عليها بمخالفة."),("استغلال الصلاحيات","يُمنع استغلال الوظيفة لتحقيق منفعة شخصية."),("تسجيل الدخول والخروج","يجب تسجيل الدخول عند بدء العمل والخروج عند الانتهاء."),("التلاعب بالفواتير","يُمنع إنشاء أو تكرار فواتير وهمية."),("تعليمات الإدارة","يجب الالتزام بتوجيهات المشرفين والإدارة.")]
@@ -38,6 +38,8 @@ async def apply_post(r):
  d=await r.post()
  try:did=int(d.get('discord_id',''))
  except:return web.Response(text='Discord ID غير صحيح',status=400)
+ allowed,reason=await can_user_apply(GUILD_ID,did)
+ if not allowed:return web.Response(text=f'لا يمكنك التقديم: {html.escape(reason)}',status=403)
  keys=['reason','daily_hours','availability','previous_experience','difficult_customer','uniform_commitment','rules_agreement'];a={k:str(d.get(k,'')).strip() for k in keys}
  if not all(a.values()) or a['uniform_commitment']!='نعم' or a['rules_agreement']!='نعم':return web.Response(text='يجب تعبئة الحقول والموافقة على الأنظمة',status=400)
  token=secrets.token_urlsafe(32);app=await create_web_application(GUILD_ID,did,a,token,datetime.now(timezone.utc).isoformat());g=r.app['bot'].get_guild(GUILD_ID)

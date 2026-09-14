@@ -35,6 +35,7 @@ CHANNEL_KEYS = {
     "employee_database_channel": "قاعدة بيانات الموظفين",
     "task_channel": "روم نشر المهام",
     "task_log": "لوق المهام",
+    "weekly_audit_log": "لوق الجرد الأسبوعي",
 }
 
 
