@@ -1215,17 +1215,34 @@ async def _bulk_employee_role(interaction: discord.Interaction):
     return employee_role, None
 
 
-class BulkEmployeeImportModal(discord.ui.Modal, title="إضافة مجموعة موظفين"):
-    employees_text = discord.ui.TextInput(
-        label="الموظفون - كل موظف في سطر",
-        style=discord.TextStyle.paragraph,
-        placeholder=(
-            "@الموظف | الاسم | الجوال | Citizen ID\n"
-            "<@123456789012345678> | محمد | 0551234567 | ABC12345"
-        ),
-        required=True,
-        max_length=4000,
-    )
+class BulkEmployeeDataModal(discord.ui.Modal, title="بيانات الموظفين المختارين"):
+    """إدخال بيانات الموظفين بعد اختيار حساباتهم من Discord."""
+
+    def __init__(self, selected_members):
+        super().__init__(timeout=300)
+        # نخزن الـ IDs والترتيب الذي اختاره المسؤول من قائمة Discord.
+        self.selected_ids = [int(member_id) for member_id, _ in selected_members]
+        self.selected_names = [str(name) for _, name in selected_members]
+
+        count = len(self.selected_ids)
+        example_names = self.selected_names[:3]
+        example_lines = []
+        for index, name in enumerate(example_names, start=1):
+            if index == 1:
+                example_lines.append(f"{name} | 0551234567 | ABC12345")
+            elif index == 2:
+                example_lines.append(f"{name} | 0509876543 | XYZ67890")
+            else:
+                example_lines.append(f"{name} | 0531112233 | DEF45678")
+
+        self.employees_text = discord.ui.TextInput(
+            label=f"البيانات بنفس الترتيب - {count} موظف",
+            style=discord.TextStyle.paragraph,
+            placeholder="\n".join(example_lines) or "الاسم | رقم الجوال | Citizen ID",
+            required=True,
+            max_length=4000,
+        )
+        self.add_item(self.employees_text)
 
     async def on_submit(self, interaction: discord.Interaction):
         if not await admin_allowed(interaction):
@@ -1235,23 +1252,30 @@ class BulkEmployeeImportModal(discord.ui.Modal, title="إضافة مجموعة �
         if error:
             return await interaction.response.send_message(error, ephemeral=True)
 
-        await interaction.response.defer(ephemeral=True, thinking=True)
-
         lines = [line.strip() for line in self.employees_text.value.splitlines() if line.strip()]
-        if not lines:
-            return await interaction.followup.send("ما فيه بيانات موظفين في الرسالة.", ephemeral=True)
+        expected = len(self.selected_ids)
+        if len(lines) != expected:
+            return await interaction.response.send_message(
+                f"❌ اخترت **{expected}** موظف، لكن أدخلت **{len(lines)}** سطر.\n"
+                "لازم يكون لكل موظف سطر واحد وبنفس ترتيب الاختيار.",
+                ephemeral=True,
+            )
+
+        await interaction.response.defer(ephemeral=True, thinking=True)
 
         added = 0
         skipped = 0
         reasons = []
 
-        for line_number, line in enumerate(lines, start=1):
+        for line_number, (uid, selected_name, line) in enumerate(
+            zip(self.selected_ids, self.selected_names, lines), start=1
+        ):
             try:
                 parts = [part.strip() for part in line.split("|")]
-                if len(parts) != 4:
-                    raise ValueError("الصيغة المطلوبة: @العضو | الاسم | رقم الجوال | Citizen ID")
+                if len(parts) != 3:
+                    raise ValueError("الصيغة المطلوبة: الاسم | رقم الجوال | Citizen ID")
 
-                uid_raw, game_name, phone_number, citizen_id = parts
+                game_name, phone_number, citizen_id = parts
                 if not game_name:
                     raise ValueError("اسم الموظف فارغ")
                 if not phone_number:
@@ -1259,14 +1283,12 @@ class BulkEmployeeImportModal(discord.ui.Modal, title="إضافة مجموعة �
                 if not citizen_id:
                     raise ValueError("Citizen ID فارغ")
 
-                uid = _normalize_import_discord_id(uid_raw)
-
                 member = interaction.guild.get_member(uid)
                 if member is None:
                     try:
                         member = await interaction.guild.fetch_member(uid)
                     except discord.NotFound:
-                        raise ValueError("العضو غير موجود داخل السيرفر")
+                        raise ValueError("العضو لم يعد موجودًا داخل السيرفر")
                     except discord.Forbidden:
                         raise ValueError("البوت غير قادر على جلب العضو؛ راجع صلاحيات البوت")
                     except discord.HTTPException as exc:
@@ -1300,8 +1322,7 @@ class BulkEmployeeImportModal(discord.ui.Modal, title="إضافة مجموعة �
                 added += 1
             except Exception as exc:
                 skipped += 1
-                safe_line = line if len(line) <= 90 else line[:87] + "..."
-                reasons.append(f"السطر {line_number}: {safe_line} — {exc}")
+                reasons.append(f"{line_number}. {selected_name} (<@{uid}>) — {exc}")
 
         await sync_employee_board(interaction.guild)
 
@@ -1313,21 +1334,21 @@ class BulkEmployeeImportModal(discord.ui.Modal, title="إضافة مجموعة �
 
         if reasons:
             details = "\n".join(f"• {reason}" for reason in reasons)
-            # نحاول إبقاء التقرير داخل الرسالة الخاصة، وإذا طال جدًا نرفقه كنص.
             if len(summary) + len(details) + 30 <= 1900:
                 summary += "\n\n**أسباب التخطي:**\n" + details
                 await interaction.followup.send(summary, ephemeral=True)
             else:
                 report = "تقرير إضافة مجموعة موظفين\n" + "=" * 32 + "\n" + "\n".join(reasons)
-                report_file = discord.File(BytesIO(report.encode("utf-8-sig")), filename="employee_import_report.txt")
+                report_file = discord.File(
+                    BytesIO(report.encode("utf-8-sig")),
+                    filename="employee_import_report.txt",
+                )
                 summary += "\n\n📄 أرفقت تقريرًا بأسباب التخطي."
                 await interaction.followup.send(summary, file=report_file, ephemeral=True)
         else:
             await interaction.followup.send(summary, ephemeral=True)
 
-
     async def on_error(self, interaction: discord.Interaction, error: Exception) -> None:
-        # إذا حصل خطأ غير متوقع داخل النافذة، نرجع رسالة بدل انتهاء التفاعل بصمت.
         message = f"❌ حصل خطأ أثناء إضافة الموظفين: {error}"
         try:
             if interaction.response.is_done():
@@ -1336,6 +1357,75 @@ class BulkEmployeeImportModal(discord.ui.Modal, title="إضافة مجموعة �
                 await interaction.response.send_message(message, ephemeral=True)
         except Exception:
             pass
+
+
+class BulkEmployeeMemberSelect(discord.ui.UserSelect):
+    def __init__(self):
+        super().__init__(
+            placeholder="اختر الموظفين بالترتيب المطلوب",
+            min_values=1,
+            max_values=25,
+            custom_id="admin:bulk_employee_member_select",
+        )
+
+    async def callback(self, interaction: discord.Interaction):
+        if not await admin_allowed(interaction):
+            return
+
+        selected_members = []
+        for user in self.values:
+            name = getattr(user, "display_name", None) or getattr(user, "name", None) or str(user)
+            selected_members.append((int(user.id), name))
+
+        view = self.view
+        view.selected_members = selected_members
+        view.open_data_button.disabled = False
+
+        order_lines = [
+            f"**{i}.** <@{uid}> — {name}"
+            for i, (uid, name) in enumerate(selected_members, start=1)
+        ]
+        # Discord يحدد طول الرسالة، و25 اسمًا عادة أقل من الحد، لكن نحتاط.
+        order_text = "\n".join(order_lines)
+        if len(order_text) > 1700:
+            order_text = order_text[:1690] + "…"
+
+        await interaction.response.edit_message(
+            content=(
+                f"✅ تم اختيار **{len(selected_members)}** موظف.\n"
+                "هذا هو **الترتيب المعتمد**؛ بعده اضغط **إدخال البيانات**، "
+                "وخل كل موظف في سطر بنفس هذا الترتيب:\n\n"
+                f"{order_text}"
+            ),
+            view=view,
+        )
+
+
+class BulkEmployeeSelectView(discord.ui.View):
+    def __init__(self):
+        super().__init__(timeout=300)
+        self.selected_members = []
+        self.member_select = BulkEmployeeMemberSelect()
+        self.add_item(self.member_select)
+
+        self.open_data_button = discord.ui.Button(
+            label="إدخال البيانات",
+            emoji="📝",
+            style=discord.ButtonStyle.success,
+            disabled=True,
+            custom_id="admin:bulk_employee_enter_data",
+        )
+        self.open_data_button.callback = self.open_data
+        self.add_item(self.open_data_button)
+
+    async def open_data(self, interaction: discord.Interaction):
+        if not await admin_allowed(interaction):
+            return
+        if not self.selected_members:
+            return await interaction.response.send_message(
+                "اختر الموظفين أولًا من القائمة.", ephemeral=True
+            )
+        await interaction.response.send_modal(BulkEmployeeDataModal(self.selected_members))
 
 
 class BulkEmployeeImportButton(discord.ui.Button):
@@ -1348,10 +1438,16 @@ class BulkEmployeeImportButton(discord.ui.Button):
         )
 
     async def callback(self, interaction: discord.Interaction):
-        # مهم: Discord يتطلب الرد على ضغط الزر خلال ثوانٍ قليلة.
-        # لا ننفذ أي استعلامات قاعدة بيانات قبل فتح النافذة حتى لا تظهر
-        # رسالة "didn't respond in time" عند بطء قاعدة البيانات أو الاستضافة.
-        await interaction.response.send_modal(BulkEmployeeImportModal())
+        if not await admin_allowed(interaction):
+            return
+
+        # نعرض اختيار أعضاء Discord أولًا حتى لا نحتاج User ID أو منشن مكتوب.
+        await interaction.response.send_message(
+            "اختر الموظفين من أعضاء السيرفر **بالترتيب**.\n"
+            "بعد الاختيار سيظهر ترتيبهم، ثم تضغط **إدخال البيانات**.",
+            view=BulkEmployeeSelectView(),
+            ephemeral=True,
+        )
 
 
 async def _weekly_target(guild_id: int) -> int:
