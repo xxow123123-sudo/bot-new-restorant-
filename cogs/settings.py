@@ -32,7 +32,7 @@ CHANNEL_KEYS = {
     "admin_log": "اللوق الإداري",
     "discipline_log": "روم المحاسبات والاسترايكات",
     "resignation_review": "طلبات الاستقالات",
-    "employee_database_channel": "قاعدة بيانات الموظفين",
+    "employee_database_channel": "روم لوحة الموظفين الثابتة",
     "task_channel": "روم نشر المهام",
     "task_log": "لوق المهام",
     "weekly_audit_log": "لوق الجرد الأسبوعي",

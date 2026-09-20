@@ -12,13 +12,12 @@ from database.db import (
     add_points, set_points, reset_all_points, add_task, get_all_employee_stats, get_employee_stats,
     create_task, set_task_message, get_task, get_active_tasks, get_task_participant_count,
     get_task_participants, accept_task, submit_task_evidence, get_task_participant_evidence, get_pending_task_submissions, complete_task_for_user, approve_task_submission, reject_task_submission, close_task,
-    save_employee_profile, get_employee_profile, search_employee_profiles, list_employee_profiles, remove_employee_profile,
+    save_employee_profile, get_employee_profile, search_employee_profiles, list_employee_profiles, list_current_employee_profiles, remove_employee_profile,
     add_disciplinary_action, get_manual_strike_level, get_attendance_strike_level,
     can_user_apply, set_reapply_allowed, create_vacation_request, get_vacation, get_active_vacation,
     accept_vacation, reject_vacation, end_vacation, get_expired_vacations, get_pending_vacations,
     get_all_weekly_activity, get_weekly_activity, reset_weekly_activity, set_setting, set_employee_status, get_total_strikes,
 )
-from employee_excel import sync_employee_excel
 
 def format_points(value: float) -> str:
     value = round(float(value), 2)
@@ -122,6 +121,86 @@ async def send_admin_log(interaction, title, description):
         embed.add_field(name="الإداري", value=interaction.user.mention, inline=False)
         await channel.send(embed=embed)
 
+def _employee_board_embeds(rows):
+    now = datetime.now(timezone.utc)
+    if not rows:
+        embed = discord.Embed(
+            title="👥 لوحة الموظفين",
+            description="لا يوجد موظفون مسجلون حاليًا.",
+            timestamp=now,
+        )
+        embed.set_footer(text="هذه اللوحة تتحدث تلقائيًا من قاعدة بيانات البوت")
+        return [embed]
+
+    lines = []
+    for index, (uid, name, phone, citizen, hired, status) in enumerate(rows, 1):
+        status_text = "🏖️ إجازة" if status == "vacation" else "🟢 موظف"
+        lines.append(
+            f"**{index}. {name}** — <@{uid}>\n"
+            f"{status_text} • Citizen ID: `{citizen}` • الجوال: `{phone}`"
+        )
+
+    descriptions = []
+    current = []
+    current_len = 0
+    for line in lines:
+        add_len = len(line) + (2 if current else 0)
+        if current and current_len + add_len > 3800:
+            descriptions.append("\n\n".join(current))
+            current = [line]
+            current_len = len(line)
+        else:
+            current.append(line)
+            current_len += add_len
+    if current:
+        descriptions.append("\n\n".join(current))
+
+    overflow = max(0, len(descriptions) - 10)
+    descriptions = descriptions[:10]
+    embeds = []
+    for page, description in enumerate(descriptions, 1):
+        title = f"👥 لوحة الموظفين — الإجمالي: {len(rows)}" if page == 1 else f"👥 الموظفون — صفحة {page}"
+        embed = discord.Embed(title=title, description=description, timestamp=now if page == 1 else None)
+        if page == 1:
+            embed.set_footer(text="تتحدث تلقائيًا عند التوظيف أو الإجازة أو الفصل أو تغيير رتبة الموظف")
+        embeds.append(embed)
+    if overflow and embeds:
+        embeds[-1].add_field(name="تنبيه", value="عدد الموظفين أكبر من سعة رسالة Discord الواحدة. استخدم زر البحث لعرض بقية السجلات.", inline=False)
+    return embeds
+
+
+async def sync_employee_board(guild: discord.Guild, view=None):
+    """إنشاء/تحديث رسالة ثابتة للموظفين بدل تصدير ملف Excel."""
+    channel_id = await get_setting(guild.id, "employee_database_channel")
+    if not channel_id:
+        channel_id = FIXED_CHANNELS.get("employee_database_log")
+    channel = guild.get_channel(int(channel_id)) if channel_id else None
+    if not isinstance(channel, discord.TextChannel):
+        return None
+
+    rows = await list_current_employee_profiles(guild.id)
+    embeds = _employee_board_embeds(rows)
+    message_id = await get_setting(guild.id, "employee_database_message")
+    message = None
+    if message_id:
+        try:
+            message = await channel.fetch_message(int(message_id))
+        except (discord.NotFound, discord.Forbidden, discord.HTTPException, ValueError):
+            message = None
+
+    try:
+        if message:
+            if view is None:
+                await message.edit(embeds=embeds)
+            else:
+                await message.edit(embeds=embeds, view=view)
+        else:
+            message = await channel.send(embeds=embeds, view=view)
+            await set_setting(guild.id, "employee_database_message", str(message.id))
+    except (discord.Forbidden, discord.HTTPException):
+        return None
+    return message
+
 class CheckInButton(discord.ui.Button):
     def __init__(self):
         super().__init__(label="تسجيل دخول", emoji="🟢", style=discord.ButtonStyle.success, custom_id="employee:checkin")
@@ -183,7 +262,6 @@ class CheckOutButton(discord.ui.Button):
         log_url = log_url or source_message.attachments[0].url
         try:
             await finish_attendance(session_id, interaction.guild.id, interaction.user.id, now.isoformat(), log_url, worked, earned)
-            await sync_employee_excel(interaction.guild)
         except Exception as exc:
             print(f"❌ Check-out database error: {type(exc).__name__}: {exc}")
             return await interaction.followup.send(
@@ -214,7 +292,6 @@ class InvoiceButton(discord.ui.Button):
         except discord.HTTPException: return await interaction.followup.send("تعذر رفع صورة الفاتورة إلى اللوق.", ephemeral=True)
         log_url = log_url or source_message.attachments[0].url
         await add_invoice(interaction.guild.id, interaction.user.id, now.isoformat(), log_url)
-        await sync_employee_excel(interaction.guild)
         try: await source_message.delete()
         except (discord.Forbidden, discord.NotFound, discord.HTTPException): pass
         await interaction.followup.send("تم احتساب الفاتورة وإضافة **1 نقطة**.", ephemeral=True)
@@ -247,7 +324,6 @@ class MemberPicker(discord.ui.UserSelect):
             worked = max(0, int((now-started).total_seconds()))
             earned = round((worked/3600)*5, 2)
             forced_count, strike_level = await force_finish_attendance(session_id, interaction.guild.id, member.id, now.isoformat(), worked, earned, interaction.user.id)
-            await sync_employee_excel(interaction.guild)
 
             # أول خروج إجباري لا يعطي Strike. من الخروج الإجباري الثاني يبدأ Strike 1.
             STRIKE_ROLES = {
@@ -299,7 +375,6 @@ class MemberPicker(discord.ui.UserSelect):
             await interaction.response.send_modal(FireEmployeeModal(member.id, member.mention))
         elif self.action == "reapply":
             await set_reapply_allowed(interaction.guild.id, member.id, True, datetime.now(timezone.utc).isoformat())
-            await sync_employee_excel(interaction.guild)
             await interaction.response.send_message(f"✅ تم السماح لـ {member.mention} بإعادة التقديم.", ephemeral=True)
             await send_admin_log(interaction, "🔓 سماح إعادة تقديم", f"العضو: {member.mention}")
         elif self.action == "stats":
@@ -327,7 +402,6 @@ class MemberPicker(discord.ui.UserSelect):
         elif self.action == "reset":
             old = await get_points(interaction.guild.id, member.id)
             await set_points(interaction.guild.id, member.id, 0, "تصفير نقاط موظف", datetime.now(timezone.utc).isoformat(), interaction.user.id)
-            await sync_employee_excel(interaction.guild)
             await interaction.response.send_message(f"تم تصفير نقاط {member.mention}. كانت **{format_points(old)}** وأصبحت **0**.", ephemeral=True)
             await send_admin_log(interaction, "♻️ تصفير نقاط موظف", f"الموظف: {member.mention}\nالنقاط السابقة: {format_points(old)}\nالنقاط الجديدة: 0")
 
@@ -511,7 +585,6 @@ class TaskApproveButton(discord.ui.Button):
         if not await admin_allowed(interaction): return
         result = await approve_task_submission(self.task_id, interaction.guild.id, self.user_id, interaction.user.id, datetime.now(timezone.utc).isoformat())
         if result == "approved":
-            await sync_employee_excel(interaction.guild)
             points = await get_points(interaction.guild.id, self.user_id)
             member = interaction.guild.get_member(self.user_id)
             name = member.mention if member else f"<@{self.user_id}>"
@@ -655,7 +728,6 @@ class PointsModal(discord.ui.Modal):
             return await interaction.response.send_message("اكتب عدد نقاط صحيح أكبر من صفر.", ephemeral=True)
         signed = amount if self.action == "add" else -amount
         await add_points(interaction.guild.id, self.user_id, signed, self.reason.value, datetime.now(timezone.utc).isoformat(), interaction.user.id)
-        await sync_employee_excel(interaction.guild)
         new_total = await get_points(interaction.guild.id, self.user_id)
         verb = "إضافة" if self.action == "add" else "خصم"
         await interaction.response.send_message(f"تم {verb} **{format_points(amount)}** نقطة لـ {self.mention}.\nنقاطه الآن: **{format_points(new_total)}**", ephemeral=True)
@@ -697,7 +769,6 @@ class DisciplineReasonModal(discord.ui.Modal):
             interaction.guild.id, member.id, self.strike_level, self.reason.value,
             interaction.user.id, now.isoformat()
         )
-        await sync_employee_excel(interaction.guild)
 
         attendance_level = await get_attendance_strike_level(interaction.guild.id, member.id)
         manual_level = await get_manual_strike_level(interaction.guild.id, member.id)
@@ -888,7 +959,6 @@ class ConfirmResetAllView(discord.ui.View):
     async def confirm(self, interaction, button):
         if not await admin_allowed(interaction): return
         count = await reset_all_points(interaction.guild.id, datetime.now(timezone.utc).isoformat(), interaction.user.id)
-        await sync_employee_excel(interaction.guild)
         await interaction.response.edit_message(content=f"✅ تم تصفير نقاط جميع الموظفين. عدد السجلات: **{count}**", view=None)
         await send_admin_log(interaction, "♻️ تصفير جميع النقاط", f"تم تصفير نقاط جميع الموظفين.\nعدد السجلات: {count}")
     @discord.ui.button(label="إلغاء", style=discord.ButtonStyle.secondary)
@@ -977,7 +1047,7 @@ class AdminEmployeeProfileModal(discord.ui.Modal):
             except discord.HTTPException:
                 member = None
 
-        if not existing and member:
+        if (not existing or existing[5] not in ("active", "vacation")) and member:
             role_id = await get_setting(interaction.guild.id, "employee_role")
             role = interaction.guild.get_role(int(role_id)) if role_id else None
             if role and role not in member.roles:
@@ -1006,6 +1076,7 @@ class AdminEmployeeProfileModal(discord.ui.Modal):
                 f"Citizen ID: {self.citizen_id.value}"
             )
         )
+        await sync_employee_board(interaction.guild)
 
 
 class AdminEmployeeProfileActionView(discord.ui.View):
@@ -1109,6 +1180,10 @@ class BulkEmployeeImportButton(discord.ui.Button):
     async def callback(self, interaction: discord.Interaction):
         if not await admin_allowed(interaction):
             return
+        role_id = await get_setting(interaction.guild.id, "employee_role")
+        employee_role = interaction.guild.get_role(int(role_id)) if role_id else None
+        if employee_role is None:
+            return await interaction.response.send_message("رتبة الموظف غير محددة. اضبطها من `/settings` أولًا.", ephemeral=True)
         await interaction.response.send_message("📥 ارفع ملف Excel الآن (.xlsx) خلال دقيقتين. الأعمدة المطلوبة: Discord ID | اسم الموظف داخل اللعبة | رقم الموظف | Citizen ID", ephemeral=True)
         def check(m):
             return m.author.id == interaction.user.id and m.channel.id == interaction.channel_id and m.attachments and m.attachments[0].filename.endswith('.xlsx')
@@ -1126,11 +1201,23 @@ class BulkEmployeeImportButton(discord.ui.Button):
                     if not uid or not game_name or not number or not citizen:
                         continue
                     try:
-                        await save_employee_profile(interaction.guild.id, int(uid), str(game_name), str(number), str(citizen), datetime.now().strftime('%Y-%m-%d'))
+                        uid = int(uid)
+                        member = interaction.guild.get_member(uid)
+                        if member is None:
+                            try:
+                                member = await interaction.guild.fetch_member(uid)
+                            except discord.HTTPException:
+                                member = None
+                        if member is None:
+                            skipped += 1
+                            continue
+                        if employee_role not in member.roles:
+                            await member.add_roles(employee_role, reason=f"استيراد موظفين بواسطة {interaction.user}")
+                        await save_employee_profile(interaction.guild.id, uid, str(game_name), str(number), str(citizen), datetime.now(timezone.utc).isoformat())
                         added += 1
                     except Exception:
                         skipped += 1
-            await sync_employee_excel(interaction.guild)
+            await sync_employee_board(interaction.guild)
             await interaction.followup.send(f"✅ تم استيراد الموظفين\n\nتمت الإضافة: {added}\nتم التخطي: {skipped}", ephemeral=True)
         except asyncio.TimeoutError:
             await interaction.followup.send("انتهى الوقت.", ephemeral=True)
@@ -1195,7 +1282,6 @@ class WeeklyTargetModal(discord.ui.Modal):
         except ValueError:
             return await interaction.response.send_message("اكتب عددًا صحيحًا من 1 إلى 9999.", ephemeral=True)
         await set_setting(interaction.guild.id, "weekly_invoice_target", str(value))
-        await sync_employee_excel(interaction.guild)
         log_channel = await get_log_channel(interaction, "weekly_audit_log")
         if log_channel:
             await log_channel.send(f"🎯 تم تغيير المطلوب الأسبوعي إلى **{value} فاتورة** لكل موظف بواسطة {interaction.user.mention}.")
@@ -1219,7 +1305,6 @@ class ConfirmWeeklyResetView(discord.ui.View):
         if log_channel:
             await log_channel.send(embed=report)
             await log_channel.send(f"♻️ **بدأ أسبوع جرد جديد** بواسطة {interaction.user.mention}. جميع عدادات الجرد الأسبوعي عادت إلى صفر.")
-        await sync_employee_excel(interaction.guild)
         await interaction.response.edit_message(
             content=(f"✅ تم حفظ الأسبوع رقم **{week_no}** وتصفير **كل إحصائيات الجرد الأسبوعي** لجميع الموظفين إلى صفر."
                      + (f"\nتم إرسال الأرشيف إلى {log_channel.mention}." if log_channel else "\n⚠️ لوق الجرد الأسبوعي غير محدد من `/settings`.")),
@@ -1306,17 +1391,17 @@ class WeeklyAuditOpenButton(discord.ui.Button):
             view=WeeklyAuditView(), ephemeral=True
         )
 
-class EmployeeExcelButton(discord.ui.Button):
+class EmployeeBoardButton(discord.ui.Button):
     def __init__(self):
-        super().__init__(label="ملف Excel الموظفين", emoji="📗", style=discord.ButtonStyle.success, custom_id="admin:employee_excel")
+        super().__init__(label="تحديث لوحة الموظفين", emoji="👥", style=discord.ButtonStyle.success, custom_id="admin:employee_board")
     async def callback(self, interaction: discord.Interaction):
         if not await admin_allowed(interaction): return
         await interaction.response.defer(ephemeral=True)
-        path = await sync_employee_excel(interaction.guild)
-        await interaction.followup.send(
-            "✅ هذا أحدث ملف Excel للموظفين، ويشمل الحالة والإجازة وإجمالي السترايكات والجرد الأسبوعي.",
-            file=discord.File(str(path), filename="employee_records.xlsx"), ephemeral=True
-        )
+        message = await sync_employee_board(interaction.guild, view=EmployeeDatabaseView())
+        if message:
+            await interaction.followup.send(f"✅ تم تحديث لوحة الموظفين الثابتة: {message.jump_url}", ephemeral=True)
+        else:
+            await interaction.followup.send("تعذر تحديث اللوحة. تأكد من ضبط روم **قاعدة بيانات الموظفين** وصلاحيات البوت.", ephemeral=True)
 
 class AdminPanel(discord.ui.View):
     def __init__(self):
@@ -1339,7 +1424,7 @@ class AdminPanel(discord.ui.View):
         self.add_item(AdminEmployeeProfileButton())
         self.add_item(BulkEmployeeImportButton())
         self.add_item(WeeklyAuditOpenButton())
-        self.add_item(EmployeeExcelButton())
+        self.add_item(EmployeeBoardButton())
 
 class ApplicationModal(discord.ui.Modal):
     def __init__(self):
@@ -1786,7 +1871,7 @@ class BreakVacationButton(discord.ui.Button):
             return await interaction.followup.send("البوت لا يقدر يعدّل الرتب. تأكد أن رتبة البوت أعلى من رتب الموظف والإجازة.", ephemeral=True)
         now = datetime.now(timezone.utc)
         await end_vacation(vacation[0], now.isoformat(), "broken_by_employee")
-        await sync_employee_excel(interaction.guild)
+        await sync_employee_board(interaction.guild)
         log_channel = await get_log_channel(interaction, "vacation_log")
         if log_channel:
             embed = discord.Embed(title="↩️ كسر إجازة", timestamp=now)
@@ -1855,17 +1940,18 @@ class VacationReviewView(discord.ui.View):
             ended_shift_text = f"{format_duration(worked)} / {format_points(earned)} نقطة"
 
         try:
-            if employee_role and employee_role in member.roles:
-                await member.remove_roles(employee_role, reason=f"بدء إجازة بواسطة {interaction.user}")
+            # نعطي رتبة الإجازة أولًا حتى لا يعتبر نظام الفصل التلقائي سحب رتبة الموظف فصلًا.
             if vacation_role not in member.roles:
                 await member.add_roles(vacation_role, reason=f"قبول إجازة بواسطة {interaction.user}")
+            if employee_role and employee_role in member.roles:
+                await member.remove_roles(employee_role, reason=f"بدء إجازة بواسطة {interaction.user}")
         except discord.Forbidden:
             return await interaction.followup.send("البوت ما يقدر يعدّل رتب الموظف/الإجازة. تأكد من ترتيب الرتب وصلاحية Manage Roles.", ephemeral=True)
 
         start_at = datetime.now(timezone.utc)
         end_at = start_at + timedelta(days=int(days))
         await accept_vacation(self.vacation_id, start_at.isoformat(), end_at.isoformat(), start_at.isoformat(), interaction.user.id)
-        await sync_employee_excel(guild)
+        await sync_employee_board(guild)
 
         if interaction.message:
             embed = interaction.message.embeds[0] if interaction.message.embeds else discord.Embed(title="طلب إجازة")
@@ -2062,7 +2148,7 @@ class HRReviewView(discord.ui.View):
         await save_employee_profile(
             guild.id, member.id, self.game_name, self.phone_number, self.citizen_id, datetime.now(timezone.utc).isoformat()
         )
-        await sync_employee_excel(guild)
+        await sync_employee_board(guild)
 
         if interaction.message:
             embed = interaction.message.embeds[0] if interaction.message.embeds else discord.Embed(title="استبيان موارد بشرية")
@@ -2141,6 +2227,15 @@ async def end_employee_membership(interaction, member: discord.Member, departure
         await force_finish_attendance(session_id, guild.id, member.id, now.isoformat(), worked, earned, interaction.user.id)
         worked_text = f"{format_duration(worked)} / {format_points(earned)} نقطة"
 
+    # إذا كان الموظف في إجازة فعالة ننهيها أولًا حتى لا تعيده مهمة انتهاء الإجازة إلى حالة موظف لاحقًا.
+    departed_at = datetime.now(timezone.utc).isoformat()
+    active_vacation = await get_active_vacation(guild.id, member.id)
+    if active_vacation:
+        await end_vacation(active_vacation[0], departed_at, "employee_departure")
+
+    # نحدّث حالة الموظف أولًا حتى لا يسجل مستمع إزالة الرتبة فصلًا تلقائيًا فوق الفصل/الاستقالة اليدوية.
+    await remove_employee_profile(guild.id, member.id, departure_type, departed_at, interaction.user.id)
+
     roles_to_remove = []
     for key in ("employee_role", "vacation_role"):
         rid = await get_setting(guild.id, key)
@@ -2154,7 +2249,6 @@ async def end_employee_membership(interaction, member: discord.Member, departure
         except discord.Forbidden:
             pass
 
-    await remove_employee_profile(guild.id, member.id, departure_type, datetime.now(timezone.utc).isoformat(), interaction.user.id)
     return worked_text
 
 
@@ -2181,7 +2275,7 @@ class FireEmployeeModal(discord.ui.Modal):
         except discord.HTTPException:
             dm_ok = False
         worked = await end_employee_membership(interaction, member, "فصل")
-        await sync_employee_excel(interaction.guild)
+        await sync_employee_board(interaction.guild)
         desc = f"الموظف: {member.mention}\nرسالة الإدارة: {self.message_text.value}"
         if worked: desc += f"\nتم إنهاء الدوام: {worked}"
         await send_admin_log(interaction, "فصل موظف", desc)
@@ -2236,7 +2330,7 @@ class ResignationReviewView(discord.ui.View):
         if not member: return await interaction.response.send_message("ما قدرت ألقى الموظف.",ephemeral=True)
         await interaction.response.defer(ephemeral=True)
         worked=await end_employee_membership(interaction,member,"استقالة")
-        await sync_employee_excel(interaction.guild)
+        await sync_employee_board(interaction.guild)
         if interaction.message:
             e=interaction.message.embeds[0]; e.add_field(name="الحالة",value=f"مقبولة بواسطة {interaction.user.mention}",inline=False); await interaction.message.edit(embed=e,view=None)
         try: await member.send("تم قبول استقالتك من **Bean Machine**.")
@@ -2283,7 +2377,7 @@ class EmployeeDatabaseView(discord.ui.View):
     @discord.ui.button(label="عرض جميع الموظفين",style=discord.ButtonStyle.secondary,custom_id="db:list")
     async def list_all(self,interaction,button):
         if not await admin_allowed(interaction): return
-        rows=await list_employee_profiles(interaction.guild.id)
+        rows=await list_current_employee_profiles(interaction.guild.id)
         if not rows: return await interaction.response.send_message("لا يوجد موظفون حاليًا.",ephemeral=True)
         chunks=[]
         for start in range(0,len(rows),10):
@@ -2295,9 +2389,9 @@ class EmployeeDatabaseView(discord.ui.View):
     @discord.ui.button(label="تحديث",style=discord.ButtonStyle.success,custom_id="db:refresh")
     async def refresh(self,interaction,button):
         if not await admin_allowed(interaction): return
-        rows=await list_employee_profiles(interaction.guild.id)
-        embed=discord.Embed(title="قاعدة بيانات الموظفين",description=f"إجمالي الموظفين الحاليين: **{len(rows)}**\n\nاستخدم الأزرار بالأسفل للبحث أو عرض الموظفين.",timestamp=datetime.now(timezone.utc))
-        await interaction.response.edit_message(embed=embed,view=self)
+        await interaction.response.defer(ephemeral=True)
+        message = await sync_employee_board(interaction.guild, view=self)
+        await interaction.followup.send("✅ تم تحديث لوحة الموظفين." if message else "تعذر تحديث لوحة الموظفين.", ephemeral=True)
 
 class OtherPanelButton(discord.ui.Button):
     def __init__(self, label, custom_id):
@@ -2351,14 +2445,10 @@ class PanelSelect(discord.ui.Select):
 
         if selected == "employee_db":
             if not await admin_allowed(interaction): return
-            channel_id = await get_setting(interaction.guild.id, "employee_database_channel")
-            target = interaction.guild.get_channel(int(channel_id)) if channel_id else None
-            if not isinstance(target, discord.TextChannel):
-                return await interaction.response.send_message("روم قاعدة بيانات الموظفين غير محدد. اضبطه من `/settings`.", ephemeral=True)
-            rows = await list_employee_profiles(interaction.guild.id)
-            embed = discord.Embed(title="قاعدة بيانات الموظفين", description=f"إجمالي الموظفين الحاليين: **{len(rows)}**\n\nاستخدم الأزرار بالأسفل للبحث أو عرض الموظفين.", timestamp=datetime.now(timezone.utc))
-            await target.send(embed=embed, view=EmployeeDatabaseView())
-            return await interaction.response.send_message(f"تم إرسال قاعدة الموظفين في {target.mention}.", ephemeral=True)
+            message = await sync_employee_board(interaction.guild, view=EmployeeDatabaseView())
+            if not message:
+                return await interaction.response.send_message("روم قاعدة بيانات الموظفين غير محدد أو البوت لا يملك صلاحية الإرسال. اضبطه من `/settings`.", ephemeral=True)
+            return await interaction.response.send_message(f"✅ تم إنشاء/تحديث لوحة الموظفين الثابتة: {message.jump_url}", ephemeral=True)
 
         await interaction.channel.send(
             embed=discord.Embed(
@@ -2390,12 +2480,135 @@ class PanelSelect(discord.ui.Select):
 class Panels(commands.Cog):
     def __init__(self, bot):
         self.bot=bot
+        self._auto_fire_in_progress = set()
         bot.add_view(EmployeePanel()); bot.add_view(AdminPanel()); bot.add_view(ApplicationPanelView()); bot.add_view(TicketControlView()); bot.add_view(VacationPanelView()); bot.add_view(HRPanelView()); bot.add_view(ResignationPanelView()); bot.add_view(EmployeeDatabaseView()); bot.add_view(WeeklyAuditView())
         asyncio.create_task(self._restore_task_views())
         self.vacation_expiry_loop.start()
+        self.employee_reconcile_loop.start()
 
     def cog_unload(self):
         self.vacation_expiry_loop.cancel()
+        self.employee_reconcile_loop.cancel()
+
+    async def _auto_fire_employee(self, guild: discord.Guild, user_id: int, reason: str, member: discord.Member | None = None):
+        key = (guild.id, int(user_id))
+        if key in self._auto_fire_in_progress:
+            return False
+        self._auto_fire_in_progress.add(key)
+        try:
+            profile = await get_employee_profile(guild.id, int(user_id))
+            if not profile or profile[5] not in ("active", "vacation"):
+                return False
+
+            now = datetime.now(timezone.utc)
+            active = await get_active_attendance(guild.id, int(user_id))
+            if active:
+                session_id, check_in_at, _ = active
+                worked = max(0, int((now - datetime.fromisoformat(check_in_at)).total_seconds()))
+                earned = round((worked / 3600) * 5, 2)
+                await finish_attendance(
+                    session_id, guild.id, int(user_id), now.isoformat(),
+                    "auto:termination", worked, earned, self.bot.user.id if self.bot.user else None
+                )
+
+            active_vacation = await get_active_vacation(guild.id, int(user_id))
+            if active_vacation:
+                await end_vacation(active_vacation[0], now.isoformat(), "auto_termination")
+
+            departure_type = f"فصل تلقائي - {reason}"
+            await remove_employee_profile(
+                guild.id, int(user_id), departure_type, now.isoformat(),
+                self.bot.user.id if self.bot.user else None
+            )
+            await sync_employee_board(guild, view=EmployeeDatabaseView())
+
+            channel = guild.get_channel(FIXED_CHANNELS.get("termination_log"))
+            if not isinstance(channel, discord.TextChannel):
+                admin_log_id = await get_setting(guild.id, "admin_log")
+                channel = guild.get_channel(int(admin_log_id)) if admin_log_id else None
+            if isinstance(channel, discord.TextChannel):
+                await channel.send(
+                    embed=discord.Embed(
+                        title="🤖 فصل تلقائي",
+                        description=f"الموظف: <@{user_id}>\nالسبب: **{reason}**\nتم تحديث لوحة الموظفين ومنع إعادة التقديم تلقائيًا.",
+                        timestamp=now,
+                    )
+                )
+            return True
+        finally:
+            self._auto_fire_in_progress.discard(key)
+
+    async def _reconcile_guild_employees(self, guild: discord.Guild):
+        employee_role_id = await get_setting(guild.id, "employee_role")
+        if not employee_role_id:
+            return
+        employee_role = guild.get_role(int(employee_role_id))
+        if employee_role is None:
+            # إذا حذفت الرتبة نفسها لا نفصل الجميع بالخطأ؛ يجب ضبط رتبة موظف صحيحة أولًا.
+            return
+
+        vacation_role_id = await get_setting(guild.id, "vacation_role")
+        vacation_role = guild.get_role(int(vacation_role_id)) if vacation_role_id else None
+        rows = await list_current_employee_profiles(guild.id)
+        for user_id, _name, _phone, _citizen, _hired, status in rows:
+            member = guild.get_member(int(user_id))
+            if member is None:
+                try:
+                    member = await guild.fetch_member(int(user_id))
+                except discord.NotFound:
+                    await self._auto_fire_employee(guild, int(user_id), "غادر السيرفر")
+                    continue
+                except discord.HTTPException:
+                    # فشل مؤقت في Discord API؛ لا نفصل الموظف اعتمادًا على خطأ اتصال.
+                    continue
+
+            if status == "vacation":
+                # الموظف في إجازة معتمدة لا يلزمه حمل رتبة الموظف حتى انتهاء الإجازة.
+                continue
+            if employee_role not in member.roles:
+                if vacation_role and vacation_role in member.roles:
+                    continue
+                await self._auto_fire_employee(guild, int(user_id), "رتبة الموظف غير موجودة", member)
+
+    @commands.Cog.listener()
+    async def on_member_remove(self, member: discord.Member):
+        await self._auto_fire_employee(member.guild, member.id, "غادر السيرفر", member)
+
+    @commands.Cog.listener()
+    async def on_member_update(self, before: discord.Member, after: discord.Member):
+        employee_role_id = await get_setting(after.guild.id, "employee_role")
+        if not employee_role_id:
+            return
+        employee_role_id = int(employee_role_id)
+        if after.guild.get_role(employee_role_id) is None:
+            # إذا حُذفت رتبة الموظف نفسها لا نفصل الجميع تلقائيًا.
+            return
+        had_employee_role = any(role.id == employee_role_id for role in before.roles)
+        has_employee_role = any(role.id == employee_role_id for role in after.roles)
+        if not had_employee_role or has_employee_role:
+            return
+
+        # سحب رتبة الموظف عند بدء الإجازة مقصود ولا يعتبر فصلًا.
+        vacation_role_id = await get_setting(after.guild.id, "vacation_role")
+        if vacation_role_id and any(role.id == int(vacation_role_id) for role in after.roles):
+            return
+        profile = await get_employee_profile(after.guild.id, after.id)
+        if profile and profile[5] == "vacation":
+            return
+        await self._auto_fire_employee(after.guild, after.id, "تم سحب رتبة الموظف", after)
+
+    @discord_tasks.loop(minutes=5)
+    async def employee_reconcile_loop(self):
+        for guild in self.bot.guilds:
+            try:
+                await self._reconcile_guild_employees(guild)
+                await sync_employee_board(guild, view=EmployeeDatabaseView())
+            except Exception as exc:
+                print(f"⚠️ تعذر تدقيق الموظفين تلقائيًا للسيرفر {guild.id}: {exc}")
+
+    @employee_reconcile_loop.before_loop
+    async def before_employee_reconcile_loop(self):
+        await self.bot.wait_until_ready()
 
     @discord_tasks.loop(minutes=1)
     async def vacation_expiry_loop(self):
@@ -2414,7 +2627,7 @@ class Panels(commands.Cog):
                     # لا ننهي السجل حتى تنجح إعادة الرتب؛ سيعيد البوت المحاولة في الدورة التالية.
                     continue
             await end_vacation(vacation_id, now.isoformat(), "expired")
-            await sync_employee_excel(guild)
+            await sync_employee_board(guild)
             channel_id = await get_setting(guild.id, "vacation_log")
             if not channel_id:
                 channel_id = FIXED_CHANNELS.get("vacation_log")
@@ -2435,9 +2648,10 @@ class Panels(commands.Cog):
         await self.bot.wait_until_ready()
         for guild in self.bot.guilds:
             try:
-                await sync_employee_excel(guild)
+                await self._reconcile_guild_employees(guild)
+                await sync_employee_board(guild, view=EmployeeDatabaseView())
             except Exception as exc:
-                print(f"⚠️ تعذر تحديث ملف Excel عند التشغيل للسيرفر {guild.id}: {exc}")
+                print(f"⚠️ تعذر تحديث لوحة الموظفين عند التشغيل للسيرفر {guild.id}: {exc}")
             try:
                 for (vacation_id,) in await get_pending_vacations(guild.id):
                     self.bot.add_view(VacationReviewView(vacation_id))
@@ -2521,14 +2735,14 @@ class Panels(commands.Cog):
 📊 **الجرد الأسبوعي**
 نظام مستقل لمتابعة المطلوب الأسبوعي، الأكثر تفاعلًا وغير المتفاعلين، وتصفير الفواتير والساعات والمهام ونقاط الأسبوع إلى صفر مع حفظ أرشيف الأسبوع السابق.
 
-📗 **ملف Excel الموظفين**
-تحميل ملف الموظفين المحدث بالحالة، الإجازات، إجمالي السترايكات، والإحصائيات الأسبوعية.
+👥 **تحديث لوحة الموظفين**
+تحديث لوحة الموظفين الثابتة في روم قاعدة بيانات الموظفين. اللوحة تتحدث تلقائيًا أيضًا عند التوظيف والإجازة والفصل.
 
 ⚠️ **محاسبة موظف**
 اختيار موظف ثم تحديد Strike 1 أو 2 أو 3 وكتابة السبب، وإرسال المحاسبة مع منشن الموظف في روم المحاسبات.
 
 🛑 **فصل موظف**
-اختيار موظف وكتابة رسالة الإدارة، ثم إزالة رتب الموظف والإجازة وحذف بياناته الوظيفية.
+اختيار موظف وكتابة رسالة الإدارة، ثم إزالة رتب الموظف والإجازة وتسجيل حالته كمفصول مع إبقاء سجله التاريخي.
 
 **تنبيه:** عمليات زيادة وخصم وتصفير النقاط والخروج الإجباري والفصل يتم تسجيلها في لوق الإدارة."""
         ),view=AdminPanel())

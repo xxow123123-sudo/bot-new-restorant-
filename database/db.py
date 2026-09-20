@@ -705,7 +705,7 @@ async def search_employee_profiles(guild_id: int, query: str):
     q = f"%{query.strip()}%"
     async with aiosqlite.connect(DB_PATH) as db:
         cur = await db.execute(
-            "SELECT user_id,game_name,phone_number,citizen_id,hired_at,status FROM employee_profiles WHERE guild_id=? AND status='active' AND (game_name LIKE ? OR phone_number LIKE ? OR citizen_id LIKE ? OR CAST(user_id AS TEXT) LIKE ?) ORDER BY game_name LIMIT 25",
+            "SELECT user_id,game_name,phone_number,citizen_id,hired_at,status FROM employee_profiles WHERE guild_id=? AND status IN ('active','vacation') AND (game_name LIKE ? OR phone_number LIKE ? OR citizen_id LIKE ? OR CAST(user_id AS TEXT) LIKE ?) ORDER BY game_name LIMIT 25",
             (guild_id,q,q,q,q),
         )
         return await cur.fetchall()
@@ -715,10 +715,21 @@ async def list_employee_profiles(guild_id: int):
         cur = await db.execute("SELECT user_id,game_name,phone_number,citizen_id,hired_at,status FROM employee_profiles WHERE guild_id=? AND status='active' ORDER BY game_name", (guild_id,))
         return await cur.fetchall()
 
+async def list_current_employee_profiles(guild_id: int):
+    """الموظفون الحاليون، ويشمل ذلك الموظف الموجود في إجازة معتمدة."""
+    async with aiosqlite.connect(DB_PATH) as db:
+        cur = await db.execute(
+            "SELECT user_id,game_name,phone_number,citizen_id,hired_at,status "
+            "FROM employee_profiles WHERE guild_id=? AND status IN ('active','vacation') "
+            "ORDER BY CASE status WHEN 'active' THEN 0 ELSE 1 END, game_name",
+            (guild_id,),
+        )
+        return await cur.fetchall()
+
 async def remove_employee_profile(guild_id: int, user_id: int, departure_type: str, departed_at: str, admin_id=None):
     """ينهي حالة الموظف مع إبقاء سجله التاريخي بدل حذفه."""
     dep = (departure_type or "").strip()
-    status = "fired" if dep == "فصل" else "resigned"
+    status = "fired" if dep.startswith("فصل") else "resigned"
     reapply_allowed = 0 if status == "fired" else 1
     async with aiosqlite.connect(DB_PATH) as db:
         await db.execute(
