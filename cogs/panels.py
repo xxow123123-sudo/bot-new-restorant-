@@ -1326,6 +1326,18 @@ class BulkEmployeeImportModal(discord.ui.Modal, title="إضافة مجموعة �
             await interaction.followup.send(summary, ephemeral=True)
 
 
+    async def on_error(self, interaction: discord.Interaction, error: Exception) -> None:
+        # إذا حصل خطأ غير متوقع داخل النافذة، نرجع رسالة بدل انتهاء التفاعل بصمت.
+        message = f"❌ حصل خطأ أثناء إضافة الموظفين: {error}"
+        try:
+            if interaction.response.is_done():
+                await interaction.followup.send(message, ephemeral=True)
+            else:
+                await interaction.response.send_message(message, ephemeral=True)
+        except Exception:
+            pass
+
+
 class BulkEmployeeImportButton(discord.ui.Button):
     def __init__(self):
         super().__init__(
@@ -1336,13 +1348,9 @@ class BulkEmployeeImportButton(discord.ui.Button):
         )
 
     async def callback(self, interaction: discord.Interaction):
-        if not await admin_allowed(interaction):
-            return
-
-        _, error = await _bulk_employee_role(interaction)
-        if error:
-            return await interaction.response.send_message(error, ephemeral=True)
-
+        # مهم: Discord يتطلب الرد على ضغط الزر خلال ثوانٍ قليلة.
+        # لا ننفذ أي استعلامات قاعدة بيانات قبل فتح النافذة حتى لا تظهر
+        # رسالة "didn't respond in time" عند بطء قاعدة البيانات أو الاستضافة.
         await interaction.response.send_modal(BulkEmployeeImportModal())
 
 
