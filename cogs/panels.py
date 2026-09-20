@@ -1208,7 +1208,7 @@ async def _bulk_employee_role(interaction: discord.Interaction):
         return None, "تعذر التحقق من رتبة البوت. أعد تشغيل البوت وحاول مرة أخرى."
     if not bot_member.guild_permissions.manage_roles:
         return None, "❌ البوت لا يملك صلاحية **Manage Roles / إدارة الرتب**. فعّلها ثم حاول مرة أخرى."
-    if employee_role.is_managed():
+    if employee_role.managed:
         return None, "❌ رتبة الموظف رتبة مُدارة ولا يستطيع البوت منحها. اختر رتبة Discord عادية من `/settings`."
     if interaction.guild.owner_id != bot_member.id and employee_role >= bot_member.top_role:
         return None, "❌ رتبة البوت يجب أن تكون **فوق رتبة الموظف** في ترتيب رتب السيرفر."
