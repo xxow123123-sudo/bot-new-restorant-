@@ -2,6 +2,7 @@ from datetime import datetime, timezone, timedelta
 import asyncio
 from io import BytesIO
 import discord
+import openpyxl
 from discord import app_commands
 from discord.ext import commands, tasks as discord_tasks
 
@@ -1173,14 +1174,20 @@ class AdminEmployeeProfileButton(discord.ui.Button):
 
 
 def _normalize_import_discord_id(value):
-    """يرجع Discord ID صحيحًا من ID رقمي أو منشن مثل <@123> / <@!123>."""
+    """يرجع Discord ID صحيحًا من نص/منشن، ويرفض أرقام Excel التي قد تكون فقدت الدقة."""
     if value is None:
-        raise ValueError("Discord ID أو منشن العضو فارغ")
+        raise ValueError("Discord ID فارغ")
+
+    # Discord IDs أطول من دقة Excel الرقمية. إذا وصلت الخلية كرقم،
+    # نرفضها حتى لا نستخدم ID تغيّرت آخر خاناته.
+    if isinstance(value, (int, float)) and not isinstance(value, bool):
+        raise ValueError("Discord ID محفوظ كرقم داخل Excel؛ اجعل الخلية Text والصق الـ ID أو المنشن من جديد")
 
     raw = str(value).strip()
     if not raw:
-        raise ValueError("Discord ID أو منشن العضو فارغ")
+        raise ValueError("Discord ID فارغ")
 
+    # يدعم المنشن <@123> و <@!123> وكذلك ID كنص عادي.
     if raw.startswith("<@") and raw.endswith(">"):
         raw = raw[2:-1]
         if raw.startswith("!"):
@@ -1188,7 +1195,7 @@ def _normalize_import_discord_id(value):
 
     raw = raw.strip().replace(" ", "")
     if not raw.isdigit():
-        raise ValueError("اكتب منشن العضو أو Discord ID الرقمي")
+        raise ValueError("Discord ID غير صالح؛ استخدم ID رقمي كنص أو منشن العضو")
     if not (17 <= len(raw) <= 20):
         raise ValueError("Discord ID غير صالح؛ عدد الخانات غير صحيح")
     return int(raw)
@@ -1215,219 +1222,6 @@ async def _bulk_employee_role(interaction: discord.Interaction):
     return employee_role, None
 
 
-class BulkEmployeeDataModal(discord.ui.Modal, title="بيانات الموظفين المختارين"):
-    """إدخال بيانات الموظفين بعد اختيار حساباتهم من Discord."""
-
-    def __init__(self, selected_members):
-        super().__init__(timeout=300)
-        # نخزن الـ IDs والترتيب الذي اختاره المسؤول من قائمة Discord.
-        self.selected_ids = [int(member_id) for member_id, _ in selected_members]
-        self.selected_names = [str(name) for _, name in selected_members]
-
-        count = len(self.selected_ids)
-        example_names = self.selected_names[:3]
-        example_lines = []
-        for index, name in enumerate(example_names, start=1):
-            if index == 1:
-                example_lines.append(f"{name} | 0551234567 | ABC12345")
-            elif index == 2:
-                example_lines.append(f"{name} | 0509876543 | XYZ67890")
-            else:
-                example_lines.append(f"{name} | 0531112233 | DEF45678")
-
-        self.employees_text = discord.ui.TextInput(
-            label=f"البيانات بنفس الترتيب - {count} موظف",
-            style=discord.TextStyle.paragraph,
-            placeholder="\n".join(example_lines) or "الاسم | رقم الجوال | Citizen ID",
-            required=True,
-            max_length=4000,
-        )
-        self.add_item(self.employees_text)
-
-    async def on_submit(self, interaction: discord.Interaction):
-        if not await admin_allowed(interaction):
-            return
-
-        employee_role, error = await _bulk_employee_role(interaction)
-        if error:
-            return await interaction.response.send_message(error, ephemeral=True)
-
-        lines = [line.strip() for line in self.employees_text.value.splitlines() if line.strip()]
-        expected = len(self.selected_ids)
-        if len(lines) != expected:
-            return await interaction.response.send_message(
-                f"❌ اخترت **{expected}** موظف، لكن أدخلت **{len(lines)}** سطر.\n"
-                "لازم يكون لكل موظف سطر واحد وبنفس ترتيب الاختيار.",
-                ephemeral=True,
-            )
-
-        await interaction.response.defer(ephemeral=True, thinking=True)
-
-        added = 0
-        skipped = 0
-        reasons = []
-
-        for line_number, (uid, selected_name, line) in enumerate(
-            zip(self.selected_ids, self.selected_names, lines), start=1
-        ):
-            try:
-                parts = [part.strip() for part in line.split("|")]
-                if len(parts) != 3:
-                    raise ValueError("الصيغة المطلوبة: الاسم | رقم الجوال | Citizen ID")
-
-                game_name, phone_number, citizen_id = parts
-                if not game_name:
-                    raise ValueError("اسم الموظف فارغ")
-                if not phone_number:
-                    raise ValueError("رقم الجوال فارغ")
-                if not citizen_id:
-                    raise ValueError("Citizen ID فارغ")
-
-                member = interaction.guild.get_member(uid)
-                if member is None:
-                    try:
-                        member = await interaction.guild.fetch_member(uid)
-                    except discord.NotFound:
-                        raise ValueError("العضو لم يعد موجودًا داخل السيرفر")
-                    except discord.Forbidden:
-                        raise ValueError("البوت غير قادر على جلب العضو؛ راجع صلاحيات البوت")
-                    except discord.HTTPException as exc:
-                        raise ValueError(f"تعذر التحقق من العضو من Discord: {exc}")
-
-                if member.bot:
-                    raise ValueError("الحساب المحدد Bot وليس موظفًا")
-
-                if employee_role not in member.roles:
-                    try:
-                        await member.add_roles(
-                            employee_role,
-                            reason=f"إضافة مجموعة موظفين بواسطة {interaction.user}",
-                        )
-                    except discord.Forbidden:
-                        raise ValueError("تعذر إعطاء رتبة الموظف؛ تأكد من Manage Roles وترتيب الرتب")
-                    except discord.HTTPException as exc:
-                        raise ValueError(f"فشل إعطاء رتبة الموظف: {exc}")
-
-                existing = await get_employee_profile(interaction.guild.id, uid)
-                hired_at = existing[4] if existing else datetime.now(timezone.utc).isoformat()
-
-                await save_employee_profile(
-                    interaction.guild.id,
-                    uid,
-                    game_name,
-                    phone_number,
-                    citizen_id,
-                    hired_at,
-                )
-                added += 1
-            except Exception as exc:
-                skipped += 1
-                reasons.append(f"{line_number}. {selected_name} (<@{uid}>) — {exc}")
-
-        await sync_employee_board(interaction.guild)
-
-        summary = (
-            "✅ تم تسجيل مجموعة الموظفين\n\n"
-            f"تمت الإضافة/التحديث: **{added}**\n"
-            f"تم التخطي: **{skipped}**"
-        )
-
-        if reasons:
-            details = "\n".join(f"• {reason}" for reason in reasons)
-            if len(summary) + len(details) + 30 <= 1900:
-                summary += "\n\n**أسباب التخطي:**\n" + details
-                await interaction.followup.send(summary, ephemeral=True)
-            else:
-                report = "تقرير إضافة مجموعة موظفين\n" + "=" * 32 + "\n" + "\n".join(reasons)
-                report_file = discord.File(
-                    BytesIO(report.encode("utf-8-sig")),
-                    filename="employee_import_report.txt",
-                )
-                summary += "\n\n📄 أرفقت تقريرًا بأسباب التخطي."
-                await interaction.followup.send(summary, file=report_file, ephemeral=True)
-        else:
-            await interaction.followup.send(summary, ephemeral=True)
-
-    async def on_error(self, interaction: discord.Interaction, error: Exception) -> None:
-        message = f"❌ حصل خطأ أثناء إضافة الموظفين: {error}"
-        try:
-            if interaction.response.is_done():
-                await interaction.followup.send(message, ephemeral=True)
-            else:
-                await interaction.response.send_message(message, ephemeral=True)
-        except Exception:
-            pass
-
-
-class BulkEmployeeMemberSelect(discord.ui.UserSelect):
-    def __init__(self):
-        super().__init__(
-            placeholder="اختر الموظفين بالترتيب المطلوب",
-            min_values=1,
-            max_values=25,
-            custom_id="admin:bulk_employee_member_select",
-        )
-
-    async def callback(self, interaction: discord.Interaction):
-        if not await admin_allowed(interaction):
-            return
-
-        selected_members = []
-        for user in self.values:
-            name = getattr(user, "display_name", None) or getattr(user, "name", None) or str(user)
-            selected_members.append((int(user.id), name))
-
-        view = self.view
-        view.selected_members = selected_members
-        view.open_data_button.disabled = False
-
-        order_lines = [
-            f"**{i}.** <@{uid}> — {name}"
-            for i, (uid, name) in enumerate(selected_members, start=1)
-        ]
-        # Discord يحدد طول الرسالة، و25 اسمًا عادة أقل من الحد، لكن نحتاط.
-        order_text = "\n".join(order_lines)
-        if len(order_text) > 1700:
-            order_text = order_text[:1690] + "…"
-
-        await interaction.response.edit_message(
-            content=(
-                f"✅ تم اختيار **{len(selected_members)}** موظف.\n"
-                "هذا هو **الترتيب المعتمد**؛ بعده اضغط **إدخال البيانات**، "
-                "وخل كل موظف في سطر بنفس هذا الترتيب:\n\n"
-                f"{order_text}"
-            ),
-            view=view,
-        )
-
-
-class BulkEmployeeSelectView(discord.ui.View):
-    def __init__(self):
-        super().__init__(timeout=300)
-        self.selected_members = []
-        self.member_select = BulkEmployeeMemberSelect()
-        self.add_item(self.member_select)
-
-        self.open_data_button = discord.ui.Button(
-            label="إدخال البيانات",
-            emoji="📝",
-            style=discord.ButtonStyle.success,
-            disabled=True,
-            custom_id="admin:bulk_employee_enter_data",
-        )
-        self.open_data_button.callback = self.open_data
-        self.add_item(self.open_data_button)
-
-    async def open_data(self, interaction: discord.Interaction):
-        if not await admin_allowed(interaction):
-            return
-        if not self.selected_members:
-            return await interaction.response.send_message(
-                "اختر الموظفين أولًا من القائمة.", ephemeral=True
-            )
-        await interaction.response.send_modal(BulkEmployeeDataModal(self.selected_members))
-
-
 class BulkEmployeeImportButton(discord.ui.Button):
     def __init__(self):
         super().__init__(
@@ -1441,13 +1235,136 @@ class BulkEmployeeImportButton(discord.ui.Button):
         if not await admin_allowed(interaction):
             return
 
-        # نعرض اختيار أعضاء Discord أولًا حتى لا نحتاج User ID أو منشن مكتوب.
+        employee_role, error = await _bulk_employee_role(interaction)
+        if error:
+            return await interaction.response.send_message(error, ephemeral=True)
+
+        # نرد مباشرة حتى لا يظهر خطأ "didn't respond in time".
         await interaction.response.send_message(
-            "اختر الموظفين من أعضاء السيرفر **بالترتيب**.\n"
-            "بعد الاختيار سيظهر ترتيبهم، ثم تضغط **إدخال البيانات**.",
-            view=BulkEmployeeSelectView(),
+            "📥 **ارفع ملف Excel (.xlsx) في نفس الروم خلال دقيقتين.**\n\n"
+            "ترتيب الأعمدة:\n"
+            "`Discord ID / المنشن | الاسم | رقم الجوال | Citizen ID`\n\n"
+            "⚠️ **مهم جدًا:** عمود Discord ID لازم يكون **Text** وليس Number.\n"
+            "والأفضل تكتب المنشن داخل الخلية مثل: `<@123456789012345678>`\n"
+            "حتى ما يغيّر Excel آخر أرقام الـ ID.",
             ephemeral=True,
         )
+
+        def check(message: discord.Message):
+            return (
+                message.author.id == interaction.user.id
+                and message.channel.id == interaction.channel_id
+                and bool(message.attachments)
+                and message.attachments[0].filename.lower().endswith(".xlsx")
+            )
+
+        try:
+            msg = await interaction.client.wait_for("message", timeout=120, check=check)
+        except asyncio.TimeoutError:
+            return await interaction.followup.send("⌛ انتهى الوقت. اضغط الزر مرة ثانية وارفع ملف Excel.", ephemeral=True)
+
+        try:
+            attachment = msg.attachments[0]
+            data = await attachment.read()
+            wb = openpyxl.load_workbook(BytesIO(data), data_only=True, read_only=True)
+            ws = wb.active
+
+            added = 0
+            skipped = 0
+            reasons = []
+
+            # الصف الأول عناوين، والبيانات تبدأ من الصف الثاني.
+            for row_number, row in enumerate(ws.iter_rows(min_row=2, values_only=True), start=2):
+                values = list(row[:4]) + [None] * max(0, 4 - len(row[:4]))
+                uid_raw, game_name, phone_number, citizen_id = values[:4]
+
+                # تجاهل الصف الفارغ بالكامل.
+                if not any(v is not None and str(v).strip() for v in (uid_raw, game_name, phone_number, citizen_id)):
+                    continue
+
+                try:
+                    uid = _normalize_import_discord_id(uid_raw)
+
+                    game_name = "" if game_name is None else str(game_name).strip()
+                    phone_number = "" if phone_number is None else str(phone_number).strip()
+                    citizen_id = "" if citizen_id is None else str(citizen_id).strip()
+
+                    if not game_name:
+                        raise ValueError("الاسم فارغ")
+                    if not phone_number:
+                        raise ValueError("رقم الجوال فارغ")
+                    if not citizen_id:
+                        raise ValueError("Citizen ID فارغ")
+
+                    member = interaction.guild.get_member(uid)
+                    if member is None:
+                        try:
+                            member = await interaction.guild.fetch_member(uid)
+                        except discord.NotFound:
+                            raise ValueError("العضو غير موجود داخل السيرفر")
+                        except discord.Forbidden:
+                            raise ValueError("البوت غير قادر على جلب العضو؛ راجع صلاحياته")
+                        except discord.HTTPException as exc:
+                            raise ValueError(f"تعذر التحقق من العضو من Discord: {exc}")
+
+                    if member.bot:
+                        raise ValueError("الحساب المحدد Bot وليس موظفًا")
+
+                    if employee_role not in member.roles:
+                        try:
+                            await member.add_roles(
+                                employee_role,
+                                reason=f"استيراد مجموعة موظفين بواسطة {interaction.user}",
+                            )
+                        except discord.Forbidden:
+                            raise ValueError("تعذر إعطاء رتبة الموظف؛ تأكد من Manage Roles وأن رتبة البوت أعلى")
+                        except discord.HTTPException as exc:
+                            raise ValueError(f"فشل إعطاء رتبة الموظف: {exc}")
+
+                    # إذا الموظف موجود مسبقًا، نحافظ على تاريخ توظيفه القديم.
+                    existing = await get_employee_profile(interaction.guild.id, uid)
+                    hired_at = existing[4] if existing else datetime.now(timezone.utc).isoformat()
+
+                    await save_employee_profile(
+                        interaction.guild.id,
+                        uid,
+                        game_name,
+                        phone_number,
+                        citizen_id,
+                        hired_at,
+                    )
+                    added += 1
+
+                except Exception as exc:
+                    skipped += 1
+                    shown_id = str(uid_raw).strip() if uid_raw is not None else "فارغ"
+                    reasons.append(f"الصف {row_number} | {shown_id} | {exc}")
+
+            wb.close()
+            await sync_employee_board(interaction.guild)
+
+            summary = (
+                "✅ تم استيراد ملف Excel\n\n"
+                f"تمت الإضافة/التحديث: **{added}**\n"
+                f"تم التخطي: **{skipped}**"
+            )
+
+            if reasons:
+                report = "تقرير استيراد الموظفين\n" + "=" * 32 + "\n" + "\n".join(reasons)
+                report_file = discord.File(
+                    BytesIO(report.encode("utf-8-sig")),
+                    filename="employee_import_report.txt",
+                )
+                summary += "\n\n📄 أرفقت تقريرًا يوضح سبب تخطي كل صف."
+                await interaction.followup.send(summary, file=report_file, ephemeral=True)
+            else:
+                await interaction.followup.send(summary, ephemeral=True)
+
+        except Exception as exc:
+            await interaction.followup.send(
+                f"❌ حصل خطأ أثناء قراءة ملف Excel: `{exc}`",
+                ephemeral=True,
+            )
 
 
 async def _weekly_target(guild_id: int) -> int:
