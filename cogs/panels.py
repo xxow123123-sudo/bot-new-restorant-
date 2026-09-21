@@ -169,8 +169,48 @@ def _employee_board_embeds(rows):
     return embeds
 
 
+def _is_employee_board_message(message: discord.Message, bot_user_id: int | None) -> bool:
+    """يتحقق أن الرسالة هي لوحة الموظفين الخاصة بهذا البوت."""
+    if bot_user_id is not None and message.author.id != bot_user_id:
+        return False
+    if not message.embeds:
+        return False
+    title = message.embeds[0].title or ""
+    return "لوحة الموظفين" in title
+
+
+async def _recover_employee_board_message(channel: discord.TextChannel, bot_user_id: int | None):
+    """يعثر على آخر لوحة موجودة في الروم إذا فُقد رقم الرسالة من قاعدة البيانات.
+
+    هذا مهم عند الاستضافة على بيئة تعيد إنشاء ملف SQLite عند إعادة التشغيل؛
+    بدل إرسال لوحة جديدة في كل تشغيل نعيد استخدام آخر لوحة موجودة.
+    """
+    matches = []
+    try:
+        async for candidate in channel.history(limit=200):
+            if _is_employee_board_message(candidate, bot_user_id):
+                matches.append(candidate)
+    except (discord.Forbidden, discord.HTTPException):
+        return None
+
+    if not matches:
+        return None
+
+    # history يعيد الأحدث أولاً، لذلك أول عنصر هو اللوحة التي سنحتفظ بها.
+    keep = matches[0]
+
+    # تنظيف اللوحات القديمة المكررة. نحذف فقط رسائل هذا البوت التي تحمل عنوان لوحة الموظفين.
+    for duplicate in matches[1:]:
+        try:
+            await duplicate.delete()
+        except (discord.NotFound, discord.Forbidden, discord.HTTPException):
+            pass
+
+    return keep
+
+
 async def sync_employee_board(guild: discord.Guild, view=None):
-    """إنشاء/تحديث رسالة ثابتة للموظفين بدل تصدير ملف Excel."""
+    """إنشاء/تحديث رسالة ثابتة واحدة للموظفين بدل تكرار اللوحة."""
     channel_id = await get_setting(guild.id, "employee_database_channel")
     if not channel_id:
         channel_id = FIXED_CHANNELS.get("employee_database_log")
@@ -182,11 +222,25 @@ async def sync_employee_board(guild: discord.Guild, view=None):
     embeds = _employee_board_embeds(rows)
     message_id = await get_setting(guild.id, "employee_database_message")
     message = None
+
+    # أولاً نحاول استخدام رقم الرسالة المحفوظ.
     if message_id:
         try:
-            message = await channel.fetch_message(int(message_id))
+            candidate = await channel.fetch_message(int(message_id))
+            if _is_employee_board_message(candidate, guild.me.id if guild.me else None):
+                message = candidate
         except (discord.NotFound, discord.Forbidden, discord.HTTPException, ValueError):
             message = None
+
+    # إذا فُقد رقم الرسالة (مثلاً بعد Restart/Deploy)، نبحث عن اللوحة الموجودة
+    # بدل إنشاء رسالة جديدة. كما يتم حذف النسخ القديمة المكررة تلقائياً.
+    if message is None:
+        message = await _recover_employee_board_message(
+            channel,
+            guild.me.id if guild.me else None,
+        )
+        if message is not None:
+            await set_setting(guild.id, "employee_database_message", str(message.id))
 
     try:
         if message:
@@ -1172,6 +1226,136 @@ class AdminEmployeeProfileButton(discord.ui.Button):
         await interaction.response.send_modal(AdminEmployeeLookupModal())
 
 
+class AddEmployeeModal(discord.ui.Modal):
+    def __init__(self):
+        super().__init__(title="إضافة موظف جديد")
+
+        self.user_id = discord.ui.TextInput(
+            label="Discord User ID أو المنشن",
+            placeholder="مثال: <@123456789012345678>",
+            required=True,
+            max_length=30,
+        )
+        self.game_name = discord.ui.TextInput(
+            label="الاسم داخل اللعبة",
+            placeholder="اكتب اسم الموظف داخل اللعبة",
+            required=True,
+            max_length=100,
+        )
+        self.phone_number = discord.ui.TextInput(
+            label="رقم الجوال داخل اللعبة",
+            placeholder="اكتب رقم الجوال",
+            required=True,
+            max_length=50,
+        )
+        self.citizen_id = discord.ui.TextInput(
+            label="Citizen ID",
+            placeholder="اكتب Citizen ID",
+            required=True,
+            max_length=100,
+        )
+
+        self.add_item(self.user_id)
+        self.add_item(self.game_name)
+        self.add_item(self.phone_number)
+        self.add_item(self.citizen_id)
+
+    async def on_submit(self, interaction: discord.Interaction):
+        if not await admin_allowed(interaction):
+            return
+
+        try:
+            uid = _normalize_import_discord_id(self.user_id.value)
+        except ValueError as exc:
+            return await interaction.response.send_message(f"❌ {exc}", ephemeral=True)
+
+        member = interaction.guild.get_member(uid)
+        if member is None:
+            try:
+                member = await interaction.guild.fetch_member(uid)
+            except (discord.NotFound, discord.Forbidden, discord.HTTPException):
+                member = None
+
+        if member is None:
+            return await interaction.response.send_message(
+                "❌ العضو غير موجود داخل السيرفر. تأكد من الـ User ID أو المنشن.",
+                ephemeral=True,
+            )
+
+        if member.bot:
+            return await interaction.response.send_message(
+                "❌ لا يمكن إضافة حساب بوت كموظف.",
+                ephemeral=True,
+            )
+
+        existing = await get_employee_profile(interaction.guild.id, uid)
+        if existing and existing[5] in ("active", "vacation"):
+            return await interaction.response.send_message(
+                f"⚠️ {member.mention} مسجل كموظف بالفعل. استخدم زر **إدارة بيانات موظف** إذا أردت تعديل بياناته.",
+                ephemeral=True,
+            )
+
+        employee_role, error = await _bulk_employee_role(interaction)
+        if error:
+            return await interaction.response.send_message(error, ephemeral=True)
+
+        hired_at = datetime.now(timezone.utc).isoformat()
+        await save_employee_profile(
+            interaction.guild.id,
+            uid,
+            self.game_name.value.strip(),
+            self.phone_number.value.strip(),
+            self.citizen_id.value.strip(),
+            hired_at,
+        )
+
+        # إنشاء سجل الإحصائيات من البداية إذا لم يكن موجودًا.
+        await get_employee_stats(interaction.guild.id, uid)
+
+        role_note = ""
+        if employee_role not in member.roles:
+            try:
+                await member.add_roles(
+                    employee_role,
+                    reason=f"إضافة موظف يدويًا بواسطة {interaction.user}",
+                )
+            except (discord.Forbidden, discord.HTTPException):
+                role_note = "\n⚠️ تم حفظ الموظف، لكن تعذر إعطاؤه رتبة الموظف."
+
+        await interaction.response.send_message(
+            f"✅ تم إضافة الموظف {member.mention} بنجاح.{role_note}",
+            ephemeral=True,
+        )
+
+        await send_admin_log(
+            interaction,
+            "➕ إضافة موظف",
+            (
+                f"الموظف: {member.mention} (`{uid}`)\n"
+                f"الاسم داخل اللعبة: {self.game_name.value.strip()}\n"
+                f"رقم الجوال: {self.phone_number.value.strip()}\n"
+                f"Citizen ID: {self.citizen_id.value.strip()}\n"
+                f"أضيف بواسطة: {interaction.user.mention}"
+            ),
+        )
+        await sync_employee_board(interaction.guild)
+
+
+class AddEmployeeButton(discord.ui.Button):
+    def __init__(self):
+        super().__init__(
+            label="إضافة موظف",
+            emoji="➕",
+            style=discord.ButtonStyle.success,
+            custom_id="admin:add_employee",
+        )
+
+    async def callback(self, interaction: discord.Interaction):
+        if not await admin_allowed(interaction):
+            return
+        await interaction.response.send_modal(AddEmployeeModal())
+
+
 
 def _normalize_import_discord_id(value):
     """يرجع Discord ID صحيحًا من نص/منشن، ويرفض أرقام Excel التي قد تكون فقدت الدقة."""
@@ -1564,6 +1748,7 @@ class AdminPanel(discord.ui.View):
         self.add_item(AdminButton("محاسبة موظف","admin:discipline","discipline",discord.ButtonStyle.danger))
         self.add_item(OpenMemberTicketButton())
         self.add_item(AdminDMButton())
+        self.add_item(AddEmployeeButton())
         self.add_item(AdminEmployeeProfileButton())
         self.add_item(BulkEmployeeImportButton())
         self.add_item(WeeklyAuditOpenButton())
@@ -2847,6 +3032,9 @@ class Panels(commands.Cog):
 
 🔴 **تسجيل خروج إجباري**
 تسجيل خروج موظف مسجل حاليًا، مع احتساب مدة عمله ونقاط الساعات حتى لحظة إخراجه.
+
+➕ **إضافة موظف**
+إضافة موظف جديد مباشرة من لوحة الإدارة بإدخال المنشن أو User ID والاسم ورقم الجوال وCitizen ID، مع إعطائه رتبة الموظف وتحديث لوحة الموظفين تلقائيًا.
 
 ➕ **زيادة نقاط**
 إضافة عدد نقاط تحدده لموظف مع كتابة سبب الإضافة.
